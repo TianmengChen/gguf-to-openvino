@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict
 
-import mlx.core as mx
+import pygguf
 import numpy as np
 import openvino as ov
 import torch
@@ -415,45 +415,47 @@ def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weigh
 
 def make_int4_weights(key, consts, reorder, head_size):#
     weight = consts[f"{key}.weight"]
-    weight = weight.view(np.uint8)
+    # weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
     orig_weight_shape[1] = orig_weight_shape[1] * 2 # double number of columns as it is 4-bit tensor
 
     weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE//2)
-    scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
-    bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
+    # scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
+    # bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
 
     if reorder:
         weight = reorder_interleaved_format(weight, head_size)
-        scale = reorder_interleaved_format(scale, head_size)
-        bias = reorder_interleaved_format(bias, head_size)
+        # scale = reorder_interleaved_format(scale, head_size)
+        # bias = reorder_interleaved_format(bias, head_size)
 
     shape = (orig_weight_shape[0], orig_weight_shape[1]//GGML_QUANTIZATION_GROUP_SIZE, GGML_QUANTIZATION_GROUP_SIZE)
+
     weight_tensor = ov.Tensor(weight.reshape(-1), shape, Type.u4)
     weights = opset.constant(weight_tensor, name=f"{key}.weight", shared_memory=False) # Don't use shared_memory=True
     weights_f16 = opset.convert(weights, Type.f16)
 
-    zero_point = (-bias / scale).astype(np.uint8)
-    zero_point_shape = list(zero_point.shape)
-    zero_point = zero_point.reshape(-1)
+    # zero_point = (-bias / scale).astype(np.uint8)
+    # zero_point_shape = list(zero_point.shape)
+    # zero_point = zero_point.reshape(-1)
     # Pack zero points: two subsequent values into one
     mask = np.array(0b00001111, dtype=np.uint8)
-    zero_point_packed = (zero_point[1::2] << 4) | (zero_point[0::2] & mask)
-    zero_point_tensor = ov.Tensor(zero_point_packed, tuple(zero_point_shape), Type.u4)
-    zero_points = opset.constant(zero_point_tensor, shared_memory=False) # Don't use shared_memory=True
-    zero_points_f16 = opset.convert(zero_points, Type.f16)
+    # zero_point_packed = (zero_point[1::2] << 4) | (zero_point[0::2] & mask)
+    # zero_point_tensor = ov.Tensor(zero_point_packed, tuple(zero_point_shape), Type.u4)
+    # zero_points = opset.constant(zero_point_tensor, shared_memory=False) # Don't use shared_memory=True
+    # zero_points_f16 = opset.convert(zero_points, Type.f16)
 
-    scales = opset.constant(scale, dtype=np.float16)
+    # scales = opset.constant(scale, dtype=np.float16)
 
-    w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy")
-    w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy")
-
+    # w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy")
+    # w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy")
+    w_zp_s = weights_f16
     w_zp_s_r = opset.reshape(w_zp_s, opset.constant(orig_weight_shape, dtype=np.int64), special_zero=False)
     w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32)
     return w_zp_s_f32
 
 
 def make_weights_subgraph(key, consts, qtype, reorder, head_size):
+    # final_node = make_fp16_weights(key, consts, reorder, head_size)
     if qtype == QType.FP16:
         final_node = make_fp16_weights(key, consts, reorder, head_size)
     elif qtype == QType.INT8:
@@ -469,7 +471,11 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
 def make_fc(key, input, consts, qtype, reorder=False, head_size=-1):
     # weight const f32 NxK
     w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size)
+
     matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
+    if consts[f"{key}.bias"] is not None:
+        bias = opset.constant(consts[f"{key}.bias"], Type.f32)
+        matmul = opset.add(matmul, bias, auto_broadcast="numpy")
     return matmul
 
 
@@ -539,11 +545,11 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
     name_suffix = f".layer{layer_idx}"
     name_prefix = "model.layers.self_attn"
     # layerNorm operation
-    input_layernorm = make_rms_norm("model.layers.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"])
+    input_layernorm = make_rms_norm(f"model.layers.{layer_idx}.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
-    q = make_fc("model.layers.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], True, configs["head_size"])
-    k = make_fc("model.layers.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], True, configs["head_size"])
-    v = make_fc("model.layers.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"])
+    q = make_fc(f"model.layers.{layer_idx}.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], False, configs["head_size"])
+    k = make_fc(f"model.layers.{layer_idx}.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], False, configs["head_size"])
+    v = make_fc(f"model.layers.{layer_idx}.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"])
 
     input_shape = opset.shape_of(input_layernorm)
     if output_shape is None:
@@ -569,18 +575,18 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
                         beam_idx=beam_idx,
                         cos_sin_cached=cos_sin_cached)
 
-    attn_output = make_fc("model.layers.self_attn.o_proj", attn_output, consts["layers"][layer_idx], configs["qtype"])
+    attn_output = make_fc(f"model.layers.{layer_idx}.self_attn.o_proj", attn_output, consts["layers"][layer_idx], configs["qtype"])
 
     attn_output = opset.add(hidden_states, attn_output, auto_broadcast="numpy", name=f"{name_prefix}.add0{name_suffix}")
-    post_attention_layernorm = make_rms_norm("model.layers.post_attention_layernorm", attn_output, consts["layers"][layer_idx], configs["rms_norm_eps"])
+    post_attention_layernorm = make_rms_norm(f"model.layers.{layer_idx}.post_attention_layernorm", attn_output, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
     # mlp
     def mlp(states):
-        gate_proj = make_fc("model.layers.mlp.gate_proj", states, consts["layers"][layer_idx], configs["qtype"])
+        gate_proj = make_fc(f"model.layers.{layer_idx}.mlp.gate_proj", states, consts["layers"][layer_idx], configs["qtype"])
         silu = opset.swish(gate_proj)
-        up_proj = make_fc("model.layers.mlp.up_proj", states, consts["layers"][layer_idx], configs["qtype"])
+        up_proj = make_fc(f"model.layers.{layer_idx}.mlp.up_proj", states, consts["layers"][layer_idx], configs["qtype"])
         mul = opset.multiply(silu, up_proj, auto_broadcast="numpy", name=f"{name_prefix}.mlp.mul{name_suffix}")
-        down_proj = make_fc("model.layers.mlp.down_proj", mul, consts["layers"][layer_idx], configs["qtype"])
+        down_proj = make_fc(f"model.layers.{layer_idx}.mlp.down_proj", mul, consts["layers"][layer_idx], configs["qtype"])
         return down_proj
 
     mlp_output = mlp(post_attention_layernorm)
@@ -673,30 +679,53 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     beg = time.time()
 
     # Load GGUF model
-    weights, metadata = mx.load(model_path, return_metadata=True)
-
+    with open(model_path, "rb") as f:
+        metadata, tensorinfo = pygguf.load_gguf(f)
+        weights_dict={}
+        for name in tensorinfo: 
+            weights, scales, biases = pygguf.load_gguf_tensor(f, tensorinfo, name)
+            weights_dict[name] = weights
+            if scales is not None:
+                weights_dict[name.replace(".weight", ".scales")] = scales
+                weights_dict[name.replace(".weight", ".biases")] = biases
+    
     print("Metadata:\n", metadata.keys())
-
     try:
         url_parts = metadata["general.source.url"].split("/")
         model_id = f"{url_parts[-2]}/{url_parts[-1]}"
     except Exception:
         print("Cannot get model_id to get the config.json and tokenizer")
         model_id = None
-
+    model_id = "Qwen/Qwen2.5-7B-Instruct"
     config = {
-        "layer_num": metadata["llama.block_count"].item(),
-        "head_num": metadata["llama.attention.head_count"].item(),
-        "head_size": metadata["llama.embedding_length"].item() // metadata["llama.attention.head_count"].item(),
-        "head_num_kv": metadata.get("llama.attention.head_count_kv", metadata["llama.attention.head_count"]).item(),
-        "hidden_size": metadata["llama.embedding_length"].item(),
-        "max_position_embeddings": metadata.get("llama.context_length", np.int32([2048])).item(),
-        "rotary_dims": metadata["llama.rope.dimension_count"].item(),
-        "rms_norm_eps": metadata["llama.attention.layer_norm_rms_epsilon"].item(),
-        "rope_freq_base": metadata.get("llama.rope.freq_base", np.float32(10000)).item(),
-        "qtype": get_quantizaiton_type(int(metadata["general.file_type"])),
+        "layer_num": metadata["qwen2.block_count"].data[0],
+        "head_num": metadata["qwen2.attention.head_count"].data[0],
+        "head_size": metadata["qwen2.embedding_length"].data[0] // metadata["qwen2.attention.head_count"].data[0],
+        "head_num_kv": metadata.get("qwen2.attention.head_count_kv", metadata["qwen2.attention.head_count"]).data[0],
+        "hidden_size": metadata["qwen2.embedding_length"].data[0],
+        "max_position_embeddings": metadata.get("qwen2.context_length", np.int32([2048])).data[0],
+        "rotary_dims": 128,
+        "rms_norm_eps": metadata["qwen2.attention.layer_norm_rms_epsilon"].data[0],
+        "rope_freq_base": metadata.get("qwen2.rope.freq_base", np.float32(10000)).data[0],
+        "qtype": get_quantizaiton_type(int(metadata["general.file_type"].data[0])),
         "model_id": model_id,        
     }
+
+    # (['split.count', 'tokenizer.ggml.add_bos_token', 'tokenizer.ggml.bos_token_id', 'tokenizer.ggml.tokens', 'general.file_type', 'qwen2.attention.layer_norm_rms_epsilon', 'general.architecture', 'tokenizer.ggml.padding_token_id', 'qwen2.embedding_length', 'split.tensors.count', 'tokenizer.ggml.pre', 'general.name', 'split.no', 'qwen2.block_count', 'general.version', 'tokenizer.ggml.eos_token_id', 'qwen2.rope.freq_base', 'general.finetune', 'tokenizer.ggml.merges', 'general.type', 'general.size_label', 'tokenizer.ggml.token_type', 'qwen2.context_length', 'tokenizer.chat_template', 'qwen2.attention.head_count_kv', 'general.quantization_version', 'tokenizer.ggml.model', 'qwen2.feed_forward_length', 'qwen2.attention.head_count'])
+
+    # config = {
+    #     "layer_num": metadata["llama.block_count"].item(),
+    #     "head_num": metadata["llama.attention.head_count"].item(),
+    #     "head_size": metadata["llama.embedding_length"].item() // metadata["llama.attention.head_count"].item(),
+    #     "head_num_kv": metadata.get("llama.attention.head_count_kv", metadata["llama.attention.head_count"]).item(),
+    #     "hidden_size": metadata["llama.embedding_length"].item(),
+    #     "max_position_embeddings": metadata.get("llama.context_length", np.int32([2048])).item(),
+    #     "rotary_dims": metadata["llama.rope.dimension_count"].item(),
+    #     "rms_norm_eps": metadata["llama.attention.layer_norm_rms_epsilon"].item(),
+    #     "rope_freq_base": metadata.get("llama.rope.freq_base", np.float32(10000)).item(),
+    #     "qtype": get_quantizaiton_type(int(metadata["general.file_type"])),
+    #     "model_id": model_id,        
+    # }   
 
     print("Config:\n", config)
 
@@ -738,40 +767,43 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     print("Extract layer weights")
     for i in range(config["layer_num"]):
         layer_weights = {
-            "model.layers.input_layernorm.weight": np.array(weights[f"blk.{i}.attn_norm.weight"]),
-            "model.layers.post_attention_layernorm.weight": np.array(weights[f"blk.{i}.ffn_norm.weight"]),
-            "model.layers.self_attn.q_proj.bias": None,
-            "model.layers.self_attn.q_proj.weight": np.array(weights[f"blk.{i}.attn_q.weight"]),
-            "model.layers.self_attn.k_proj.bias": None,
-            "model.layers.self_attn.k_proj.weight": np.array(weights[f"blk.{i}.attn_k.weight"]),
-            "model.layers.self_attn.v_proj.bias": None,
-            "model.layers.self_attn.v_proj.weight": np.array(weights[f"blk.{i}.attn_v.weight"]),
-            "model.layers.self_attn.o_proj.bias": None,
-            "model.layers.self_attn.o_proj.weight": np.array(weights[f"blk.{i}.attn_output.weight"]),
-            "model.layers.mlp.gate_proj.bias": None,
-            "model.layers.mlp.gate_proj.weight": np.array(weights[f"blk.{i}.ffn_gate.weight"]),
-            "model.layers.mlp.up_proj.bias": None,
-            "model.layers.mlp.up_proj.weight": np.array(weights[f"blk.{i}.ffn_up.weight"]),
-            "model.layers.mlp.down_proj.bias": None,
-            "model.layers.mlp.down_proj.weight": np.array(weights[f"blk.{i}.ffn_down.weight"])
+            f"model.layers.{i}.input_layernorm.weight": np.array(weights[f"blk.{i}.attn_norm.weight"]),
+            f"model.layers.{i}.post_attention_layernorm.weight": np.array(weights[f"blk.{i}.ffn_norm.weight"]),
+            # "model.layers.self_attn.q_proj.bias": None,
+            f"model.layers.{i}.self_attn.q_proj.bias": np.array(weights[f"blk.{i}.attn_q.bias"]),
+            f"model.layers.{i}.self_attn.q_proj.weight": np.array(weights[f"blk.{i}.attn_q.weight"]),
+            # "model.layers.self_attn.k_proj.bias": None,
+            f"model.layers.{i}.self_attn.k_proj.bias": np.array(weights[f"blk.{i}.attn_k.bias"]),
+            f"model.layers.{i}.self_attn.k_proj.weight": np.array(weights[f"blk.{i}.attn_k.weight"]),
+            # "model.layers.self_attn.v_proj.bias": None,
+            f"model.layers.{i}.self_attn.v_proj.bias": np.array(weights[f"blk.{i}.attn_v.bias"]),
+            f"model.layers.{i}.self_attn.v_proj.weight": np.array(weights[f"blk.{i}.attn_v.weight"]),
+            f"model.layers.{i}.self_attn.o_proj.bias": None,
+            f"model.layers.{i}.self_attn.o_proj.weight": np.array(weights[f"blk.{i}.attn_output.weight"]),
+            f"model.layers.{i}.mlp.gate_proj.bias": None,
+            f"model.layers.{i}.mlp.gate_proj.weight": np.array(weights[f"blk.{i}.ffn_gate.weight"]),
+            f"model.layers.{i}.mlp.up_proj.bias": None,
+            f"model.layers.{i}.mlp.up_proj.weight": np.array(weights[f"blk.{i}.ffn_up.weight"]),
+            f"model.layers.{i}.mlp.down_proj.bias": None,
+            f"model.layers.{i}.mlp.down_proj.weight": np.array(weights[f"blk.{i}.ffn_down.weight"])
         }
         if config["qtype"] != QType.FP16:
             q_weights = {
-                "model.layers.self_attn.q_proj.scales": np.array(weights[f"blk.{i}.attn_q.scales"]),
-                "model.layers.self_attn.k_proj.scales": np.array(weights[f"blk.{i}.attn_k.scales"]),
-                "model.layers.self_attn.v_proj.scales": np.array(weights[f"blk.{i}.attn_v.scales"]),
-                "model.layers.self_attn.o_proj.scales": np.array(weights[f"blk.{i}.attn_output.scales"]),
-                "model.layers.mlp.gate_proj.scales": np.array(weights[f"blk.{i}.ffn_gate.scales"]),
-                "model.layers.mlp.up_proj.scales": np.array(weights[f"blk.{i}.ffn_up.scales"]),
-                "model.layers.mlp.down_proj.scales": np.array(weights[f"blk.{i}.ffn_down.scales"]),
+                f"model.layers.{i}.self_attn.q_proj.scales": np.array(weights[f"blk.{i}.attn_q.scales"]),
+                f"model.layers.{i}.self_attn.k_proj.scales": np.array(weights[f"blk.{i}.attn_k.scales"]),
+                f"model.layers.{i}.self_attn.v_proj.scales": np.array(weights[f"blk.{i}.attn_v.scales"]),
+                f"model.layers.{i}.self_attn.o_proj.scales": np.array(weights[f"blk.{i}.attn_output.scales"]),
+                f"model.layers.{i}.mlp.gate_proj.scales": np.array(weights[f"blk.{i}.ffn_gate.scales"]),
+                f"model.layers.{i}.mlp.up_proj.scales": np.array(weights[f"blk.{i}.ffn_up.scales"]),
+                f"model.layers.{i}.mlp.down_proj.scales": np.array(weights[f"blk.{i}.ffn_down.scales"]),
 
-                "model.layers.self_attn.q_proj.biases": np.array(weights[f"blk.{i}.attn_q.biases"]),
-                "model.layers.self_attn.k_proj.biases": np.array(weights[f"blk.{i}.attn_k.biases"]),
-                "model.layers.self_attn.v_proj.biases": np.array(weights[f"blk.{i}.attn_v.biases"]),
-                "model.layers.self_attn.o_proj.biases": np.array(weights[f"blk.{i}.attn_output.biases"]),
-                "model.layers.mlp.gate_proj.biases": np.array(weights[f"blk.{i}.ffn_gate.biases"]),
-                "model.layers.mlp.up_proj.biases": np.array(weights[f"blk.{i}.ffn_up.biases"]),
-                "model.layers.mlp.down_proj.biases": np.array(weights[f"blk.{i}.ffn_down.biases"])
+                f"model.layers.{i}.self_attn.q_proj.biases": np.array(weights[f"blk.{i}.attn_q.biases"]),
+                f"model.layers.{i}.self_attn.k_proj.biases": np.array(weights[f"blk.{i}.attn_k.biases"]),
+                f"model.layers.{i}.self_attn.v_proj.biases": np.array(weights[f"blk.{i}.attn_v.biases"]),
+                f"model.layers.{i}.self_attn.o_proj.biases": np.array(weights[f"blk.{i}.attn_output.biases"]),
+                f"model.layers.{i}.mlp.gate_proj.biases": np.array(weights[f"blk.{i}.ffn_gate.biases"]),
+                f"model.layers.{i}.mlp.up_proj.biases": np.array(weights[f"blk.{i}.ffn_up.biases"]),
+                f"model.layers.{i}.mlp.down_proj.biases": np.array(weights[f"blk.{i}.ffn_down.biases"])
             }
             layer_weights = {**layer_weights, **q_weights}
 
@@ -790,11 +822,13 @@ if __name__ == "__main__":
     parser.add_argument("--ov_model_path", type=str, nargs="?", default="./gen/llama-2-7b-chat/")
     parser.add_argument("--model_id", type=str, nargs="?", default=None)
     args = parser.parse_args()
-
+    beg = time.time()
     os.makedirs(args.ov_model_path, exist_ok=True)
 
     config, consts = load_gguf_model(args.org_model_path)
     model = create_model(config, consts)
+    cost = time.time() - beg
+    print(f"convert done, cost {cost:.2f} seconds.")
     show_model(model)
 
     print(f"serialize ov model to '{args.ov_model_path}'...")
@@ -805,10 +839,10 @@ if __name__ == "__main__":
 
     # save tokenizer and config to load with GenAI and Optimum
     model_id = args.model_id or config["model_id"] #"HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
-    if model_id:
-        print(f"save tokenzier to '{args.ov_model_path}' ...")
-        save_tokenzier(model_id, args.ov_model_path)
-        config = AutoConfig.from_pretrained(model_id)
-        config.save_pretrained(args.ov_model_path)
-    else:
-        print("[WARNING]: Tokenizer and config.json were not saved because model_id was not found or provided as an option.")
+    # if model_id:
+    #     print(f"save tokenzier to '{args.ov_model_path}' ...")
+    #     save_tokenzier(model_id, args.ov_model_path)
+    #     config = AutoConfig.from_pretrained(model_id)
+    #     config.save_pretrained(args.ov_model_path)
+    # else:
+    #     print("[WARNING]: Tokenizer and config.json were not saved because model_id was not found or provided as an option.")
