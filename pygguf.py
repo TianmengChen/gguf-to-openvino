@@ -357,7 +357,7 @@ def dequantize_q6_k(data):
         sc[:, 13] * q7[:, 16:],
         sc[:, 14] * q8[:, :16],
         sc[:, 15] * q8[:, 16:],
-    ], axis=1)
+    ], axis=1), None, None
 
 def dequantize_q4_0_origin(data):
     # C implementation

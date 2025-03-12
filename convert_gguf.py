@@ -471,8 +471,7 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
 def make_fc(key, input, consts, qtype, reorder=False, head_size=-1):
     # weight const f32 NxK
     w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size)
-
-    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
+    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=False)
     if consts[f"{key}.bias"] is not None:
         bias = opset.constant(consts[f"{key}.bias"], Type.f32)
         matmul = opset.add(matmul, bias, auto_broadcast="numpy")
@@ -617,7 +616,7 @@ def create_model(configs, consts):
 
     inputs_embeds, embeddings = make_embedding("model.embed_tokens", input_ids, consts, configs["qtype"])
     hidden_states = inputs_embeds
-
+    
     rope_const = init_rope(configs["head_size"], configs["max_position_embeddings"], configs["rope_freq_base"])
 
     input_shape = opset.shape_of(input_ids)
@@ -681,14 +680,19 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     # Load GGUF model
     with open(model_path, "rb") as f:
         metadata, tensorinfo = pygguf.load_gguf(f)
-        weights_dict={}
+        weights={}
         for name in tensorinfo: 
-            weights, scales, biases = pygguf.load_gguf_tensor(f, tensorinfo, name)
-            weights_dict[name] = weights
+            weight, scales, biases = pygguf.load_gguf_tensor(f, tensorinfo, name)
+            weights[name] = weight
             if scales is not None:
-                weights_dict[name.replace(".weight", ".scales")] = scales
-                weights_dict[name.replace(".weight", ".biases")] = biases
-    
+                weights[name.replace(".weight", ".scales")] = scales
+                weights[name.replace(".weight", ".biases")] = biases
+
+            if "token_embd" in name:
+                weights[name] = weight.reshape(tensorinfo[name]["shape"][-1],-1)
+                weights[name.replace(".weight", ".scales")] = scales.reshape(tensorinfo[name]["shape"][-1],-1)
+                weights[name.replace(".weight", ".biases")] = biases.reshape(tensorinfo[name]["shape"][-1],-1)
+
     print("Metadata:\n", metadata.keys())
     try:
         url_parts = metadata["general.source.url"].split("/")
@@ -698,41 +702,25 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         model_id = None
     model_id = "Qwen/Qwen2.5-7B-Instruct"
     config = {
-        "layer_num": metadata["qwen2.block_count"].data[0],
-        "head_num": metadata["qwen2.attention.head_count"].data[0],
-        "head_size": metadata["qwen2.embedding_length"].data[0] // metadata["qwen2.attention.head_count"].data[0],
-        "head_num_kv": metadata.get("qwen2.attention.head_count_kv", metadata["qwen2.attention.head_count"]).data[0],
-        "hidden_size": metadata["qwen2.embedding_length"].data[0],
-        "max_position_embeddings": metadata.get("qwen2.context_length", np.int32([2048])).data[0],
+        "layer_num": metadata["qwen2.block_count"],
+        "head_num": metadata["qwen2.attention.head_count"],
+        "head_size": metadata["qwen2.embedding_length"] // metadata["qwen2.attention.head_count"],
+        "head_num_kv": metadata.get("qwen2.attention.head_count_kv", metadata["qwen2.attention.head_count"]),
+        "hidden_size": metadata["qwen2.embedding_length"],
+        "max_position_embeddings": metadata.get("qwen2.context_length", np.int32([2048])),
         "rotary_dims": 128,
-        "rms_norm_eps": metadata["qwen2.attention.layer_norm_rms_epsilon"].data[0],
-        "rope_freq_base": metadata.get("qwen2.rope.freq_base", np.float32(10000)).data[0],
-        "qtype": get_quantizaiton_type(int(metadata["general.file_type"].data[0])),
+        "rms_norm_eps": metadata["qwen2.attention.layer_norm_rms_epsilon"],
+        "rope_freq_base": metadata.get("qwen2.rope.freq_base", np.float32(10000)),
+        "qtype": get_quantizaiton_type(int(metadata["general.file_type"])),
         "model_id": model_id,        
     }
-
-    # (['split.count', 'tokenizer.ggml.add_bos_token', 'tokenizer.ggml.bos_token_id', 'tokenizer.ggml.tokens', 'general.file_type', 'qwen2.attention.layer_norm_rms_epsilon', 'general.architecture', 'tokenizer.ggml.padding_token_id', 'qwen2.embedding_length', 'split.tensors.count', 'tokenizer.ggml.pre', 'general.name', 'split.no', 'qwen2.block_count', 'general.version', 'tokenizer.ggml.eos_token_id', 'qwen2.rope.freq_base', 'general.finetune', 'tokenizer.ggml.merges', 'general.type', 'general.size_label', 'tokenizer.ggml.token_type', 'qwen2.context_length', 'tokenizer.chat_template', 'qwen2.attention.head_count_kv', 'general.quantization_version', 'tokenizer.ggml.model', 'qwen2.feed_forward_length', 'qwen2.attention.head_count'])
-
-    # config = {
-    #     "layer_num": metadata["llama.block_count"].item(),
-    #     "head_num": metadata["llama.attention.head_count"].item(),
-    #     "head_size": metadata["llama.embedding_length"].item() // metadata["llama.attention.head_count"].item(),
-    #     "head_num_kv": metadata.get("llama.attention.head_count_kv", metadata["llama.attention.head_count"]).item(),
-    #     "hidden_size": metadata["llama.embedding_length"].item(),
-    #     "max_position_embeddings": metadata.get("llama.context_length", np.int32([2048])).item(),
-    #     "rotary_dims": metadata["llama.rope.dimension_count"].item(),
-    #     "rms_norm_eps": metadata["llama.attention.layer_norm_rms_epsilon"].item(),
-    #     "rope_freq_base": metadata.get("llama.rope.freq_base", np.float32(10000)).item(),
-    #     "qtype": get_quantizaiton_type(int(metadata["general.file_type"])),
-    #     "model_id": model_id,        
-    # }   
 
     print("Config:\n", config)
 
     # Extract weights and biases
     print("Extract weights and biases")
     print("============= Weight keys ============")
-    print(list(weights.keys()))
+    # print(list(weights.keys()))
     consts = {
         "model.embed_tokens.weight": np.array(weights["token_embd.weight"]),
         "model.norm.weight": np.array(weights["output_norm.weight"]),
