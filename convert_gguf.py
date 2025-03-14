@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict
 
-import pygguf
+import mlx.core as mx
 import numpy as np
 import openvino as ov
 import torch
@@ -415,47 +415,46 @@ def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weigh
 
 def make_int4_weights(key, consts, reorder, head_size):#
     weight = consts[f"{key}.weight"]
-    # weight = weight.view(np.uint8)
+    weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
     orig_weight_shape[1] = orig_weight_shape[1] * 2 # double number of columns as it is 4-bit tensor
 
     weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE//2)
-    # scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
-    # bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
+    scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
+    bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
 
     if reorder:
         weight = reorder_interleaved_format(weight, head_size)
-        # scale = reorder_interleaved_format(scale, head_size)
-        # bias = reorder_interleaved_format(bias, head_size)
+        scale = reorder_interleaved_format(scale, head_size)
+        bias = reorder_interleaved_format(bias, head_size)
 
     shape = (orig_weight_shape[0], orig_weight_shape[1]//GGML_QUANTIZATION_GROUP_SIZE, GGML_QUANTIZATION_GROUP_SIZE)
-
     weight_tensor = ov.Tensor(weight.reshape(-1), shape, Type.u4)
     weights = opset.constant(weight_tensor, name=f"{key}.weight", shared_memory=False) # Don't use shared_memory=True
     weights_f16 = opset.convert(weights, Type.f16)
 
-    # zero_point = (-bias / scale).astype(np.uint8)
-    # zero_point_shape = list(zero_point.shape)
-    # zero_point = zero_point.reshape(-1)
+    zero_point = (-bias / scale).astype(np.uint8)
+
+    zero_point_shape = list(zero_point.shape)
+    zero_point = zero_point.reshape(-1)
     # Pack zero points: two subsequent values into one
     mask = np.array(0b00001111, dtype=np.uint8)
-    # zero_point_packed = (zero_point[1::2] << 4) | (zero_point[0::2] & mask)
-    # zero_point_tensor = ov.Tensor(zero_point_packed, tuple(zero_point_shape), Type.u4)
-    # zero_points = opset.constant(zero_point_tensor, shared_memory=False) # Don't use shared_memory=True
-    # zero_points_f16 = opset.convert(zero_points, Type.f16)
+    zero_point_packed = (zero_point[1::2] << 4) | (zero_point[0::2] & mask)
+    zero_point_tensor = ov.Tensor(zero_point_packed, tuple(zero_point_shape), Type.u4)
+    zero_points = opset.constant(zero_point_tensor, shared_memory=False) # Don't use shared_memory=True
+    zero_points_f16 = opset.convert(zero_points, Type.f16)
 
-    # scales = opset.constant(scale, dtype=np.float16)
+    scales = opset.constant(scale, dtype=np.float16, shared_memory=False)
 
-    # w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy")
-    # w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy")
-    w_zp_s = weights_f16
+    w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy")
+    w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy")
+
     w_zp_s_r = opset.reshape(w_zp_s, opset.constant(orig_weight_shape, dtype=np.int64), special_zero=False)
     w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32)
     return w_zp_s_f32
 
 
 def make_weights_subgraph(key, consts, qtype, reorder, head_size):
-    # final_node = make_fp16_weights(key, consts, reorder, head_size)
     if qtype == QType.FP16:
         final_node = make_fp16_weights(key, consts, reorder, head_size)
     elif qtype == QType.INT8:
@@ -471,7 +470,7 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
 def make_fc(key, input, consts, qtype, reorder=False, head_size=-1):
     # weight const f32 NxK
     w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size)
-    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=False)
+    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
     if consts[f"{key}.bias"] is not None:
         bias = opset.constant(consts[f"{key}.bias"], Type.f32)
         matmul = opset.add(matmul, bias, auto_broadcast="numpy")
@@ -616,7 +615,7 @@ def create_model(configs, consts):
 
     inputs_embeds, embeddings = make_embedding("model.embed_tokens", input_ids, consts, configs["qtype"])
     hidden_states = inputs_embeds
-    
+
     rope_const = init_rope(configs["head_size"], configs["max_position_embeddings"], configs["rope_freq_base"])
 
     input_shape = opset.shape_of(input_ids)
@@ -636,7 +635,7 @@ def create_model(configs, consts):
     # final_layernorm
     final_layernorm = make_rms_norm("model.norm", hidden_states, consts, configs["rms_norm_eps"])
     # embed_out
-    embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings, configs["qtype"])
+    embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings, QType.INT8)#for qwen2.5 0.5b
 
     logits = opset.result(embed_out, name="logits")
     logits.set_friendly_name("logits")
@@ -678,22 +677,9 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     beg = time.time()
 
     # Load GGUF model
-    with open(model_path, "rb") as f:
-        metadata, tensorinfo = pygguf.load_gguf(f)
-        weights={}
-        for name in tensorinfo: 
-            weight, scales, biases = pygguf.load_gguf_tensor(f, tensorinfo, name)
-            weights[name] = weight
-            if scales is not None:
-                weights[name.replace(".weight", ".scales")] = scales
-                weights[name.replace(".weight", ".biases")] = biases
-
-            if "token_embd" in name:
-                weights[name] = weight.reshape(tensorinfo[name]["shape"][-1],-1)
-                weights[name.replace(".weight", ".scales")] = scales.reshape(tensorinfo[name]["shape"][-1],-1)
-                weights[name.replace(".weight", ".biases")] = biases.reshape(tensorinfo[name]["shape"][-1],-1)
-
+    weights, metadata = mx.load(model_path, return_metadata=True)
     print("Metadata:\n", metadata.keys())
+
     try:
         url_parts = metadata["general.source.url"].split("/")
         model_id = f"{url_parts[-2]}/{url_parts[-1]}"
@@ -702,15 +688,15 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         model_id = None
     model_id = "Qwen/Qwen2.5-7B-Instruct"
     config = {
-        "layer_num": metadata["qwen2.block_count"],
-        "head_num": metadata["qwen2.attention.head_count"],
-        "head_size": metadata["qwen2.embedding_length"] // metadata["qwen2.attention.head_count"],
-        "head_num_kv": metadata.get("qwen2.attention.head_count_kv", metadata["qwen2.attention.head_count"]),
-        "hidden_size": metadata["qwen2.embedding_length"],
-        "max_position_embeddings": metadata.get("qwen2.context_length", np.int32([2048])),
+        "layer_num": metadata["qwen2.block_count"].item(),
+        "head_num": metadata["qwen2.attention.head_count"].item(),
+        "head_size": metadata["qwen2.embedding_length"].item() // metadata["qwen2.attention.head_count"].item(),
+        "head_num_kv": metadata.get("qwen2.attention.head_count_kv", metadata["qwen2.attention.head_count"]).item(),
+        "hidden_size": metadata["qwen2.embedding_length"].item(),
+        "max_position_embeddings": metadata.get("qwen2.context_length", np.int32([2048])).item(),
         "rotary_dims": 128,
-        "rms_norm_eps": metadata["qwen2.attention.layer_norm_rms_epsilon"],
-        "rope_freq_base": metadata.get("qwen2.rope.freq_base", np.float32(10000)),
+        "rms_norm_eps": metadata["qwen2.attention.layer_norm_rms_epsilon"].item(),
+        "rope_freq_base": metadata.get("qwen2.rope.freq_base", np.float32(10000)).item(),
         "qtype": get_quantizaiton_type(int(metadata["general.file_type"])),
         "model_id": model_id,        
     }
@@ -720,7 +706,7 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     # Extract weights and biases
     print("Extract weights and biases")
     print("============= Weight keys ============")
-    # print(list(weights.keys()))
+    print(list(weights.keys()))
     consts = {
         "model.embed_tokens.weight": np.array(weights["token_embd.weight"]),
         "model.norm.weight": np.array(weights["output_norm.weight"]),
@@ -734,22 +720,6 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     if weights.get("output.scales", None) is not None:
         consts["lm_head.scales"] = np.array(weights["output.scales"])
         consts["lm_head.biases"] = np.array(weights["output.biases"])
-
-
-    # w = np.array(weights["blk.15.attn_q.weight"])
-    # s = np.array(weights["blk.15.attn_q.scales"])
-    # b = np.array(weights["blk.15.attn_q.biases"])
-
-    # print("blk.15.attn_q.weight:", w.shape)
-    # print("blk.15.attn_q.scales:", s.shape)
-    # print("blk.15.attn_q.biases:", b.shape)
-    # print("blk.15.attn_q.weight:", w.dtype)
-    # print("blk.15.attn_q.scales:", s.dtype)
-    # print("blk.15.attn_q.biases:", b.dtype)
-
-    # print("blk.15.attn_q.scales: ", s)
-    # print("blk.15.attn_q.biases: ", b)
-    # print("ratio: ", b/s)
     
     # Extract layer weights
     print("Extract layer weights")
@@ -805,12 +775,13 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
 
 
 if __name__ == "__main__":
+    beg = time.time()
     parser = argparse.ArgumentParser("")
     parser.add_argument("--org_model_path", type=str, default="Model ID (can be a Hugginface Hub id, or a local directory)")
     parser.add_argument("--ov_model_path", type=str, nargs="?", default="./gen/llama-2-7b-chat/")
     parser.add_argument("--model_id", type=str, nargs="?", default=None)
     args = parser.parse_args()
-    beg = time.time()
+
     os.makedirs(args.ov_model_path, exist_ok=True)
 
     config, consts = load_gguf_model(args.org_model_path)
@@ -827,10 +798,10 @@ if __name__ == "__main__":
 
     # save tokenizer and config to load with GenAI and Optimum
     model_id = args.model_id or config["model_id"] #"HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
-    # if model_id:
-    #     print(f"save tokenzier to '{args.ov_model_path}' ...")
-    #     save_tokenzier(model_id, args.ov_model_path)
-    #     config = AutoConfig.from_pretrained(model_id)
-    #     config.save_pretrained(args.ov_model_path)
-    # else:
-    #     print("[WARNING]: Tokenizer and config.json were not saved because model_id was not found or provided as an option.")
+    if model_id:
+        print(f"save tokenzier to '{args.ov_model_path}' ...")
+        save_tokenzier(model_id, args.ov_model_path)
+        config = AutoConfig.from_pretrained(model_id)
+        config.save_pretrained(args.ov_model_path)
+    else:
+        print("[WARNING]: Tokenizer and config.json were not saved because model_id was not found or provided as an option.")
