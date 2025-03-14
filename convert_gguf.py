@@ -385,7 +385,8 @@ def make_fp16_weights(key, consts, reorder, head_size):
 
 def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weight, weight.shape, const_dtype)
     weight = consts[f"{key}.weight"]
-    weight = weight.view(np.uint8)
+    print("------------------------------------",key)
+    # weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
     weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE)
     scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
@@ -413,7 +414,7 @@ def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weigh
     return w_zp_s_f32
 
 
-def make_int4_weights(key, consts, reorder, head_size):#
+def make_int4_weights(key, consts, reorder, head_size):
     weight = consts[f"{key}.weight"]
     # weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
@@ -471,7 +472,7 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
 def make_fc(key, input, consts, qtype, reorder=False, head_size=-1):
     # weight const f32 NxK
     w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size)
-    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=False)
+    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
     if consts[f"{key}.bias"] is not None:
         bias = opset.constant(consts[f"{key}.bias"], Type.f32)
         matmul = opset.add(matmul, bias, auto_broadcast="numpy")
@@ -636,8 +637,8 @@ def create_model(configs, consts):
     # final_layernorm
     final_layernorm = make_rms_norm("model.norm", hidden_states, consts, configs["rms_norm_eps"])
     # embed_out
-    embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings, configs["qtype"])
-
+    embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings, QType.INT8)#TODO
+    # embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings, configs["qtype"])
     logits = opset.result(embed_out, name="logits")
     logits.set_friendly_name("logits")
     cost = time.time() - beg
@@ -671,6 +672,12 @@ def get_quantizaiton_type(gguf_type):
         raise ValueError("Using unsupported GGUF quantization")
     return qtype
 
+def check_q_layer(name):
+    names = ["attn_q", "attn_output"]
+    for n in names:
+        if n in name:
+            return True
+    return False
 
 def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Extract configurations and weights from GGUF model"""
@@ -683,15 +690,18 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         weights={}
         for name in tensorinfo: 
             weight, scales, biases = pygguf.load_gguf_tensor(f, tensorinfo, name)
-            weights[name] = weight
             if scales is not None:
-                weights[name.replace(".weight", ".scales")] = scales
-                weights[name.replace(".weight", ".biases")] = biases
-
-            if "token_embd" in name:
-                weights[name] = weight.reshape(tensorinfo[name]["shape"][-1],-1)
-                weights[name.replace(".weight", ".scales")] = scales.reshape(tensorinfo[name]["shape"][-1],-1)
-                weights[name.replace(".weight", ".biases")] = biases.reshape(tensorinfo[name]["shape"][-1],-1)
+                shape = tensorinfo[name]["shape"]
+                if check_q_layer(name):#TODO                
+                    weights[name] = weight.reshape([shape[0], -1])
+                    weights[name.replace(".weight", ".scales")] = scales.reshape([shape[0], -1])
+                    weights[name.replace(".weight", ".biases")] = biases.reshape([shape[0], -1])
+                else:                
+                    weights[name] = weight.reshape([shape[-1], -1])
+                    weights[name.replace(".weight", ".scales")] = scales.reshape([shape[-1], -1])
+                    weights[name.replace(".weight", ".biases")] = biases.reshape([shape[-1], -1])
+            else:
+                weights[name] = weight
 
     print("Metadata:\n", metadata.keys())
     try:
@@ -811,10 +821,10 @@ if __name__ == "__main__":
 
     # save tokenizer and config to load with GenAI and Optimum
     model_id = args.model_id or config["model_id"] #"HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
-    # if model_id:
-    #     print(f"save tokenzier to '{args.ov_model_path}' ...")
-    #     save_tokenzier(model_id, args.ov_model_path)
-    #     config = AutoConfig.from_pretrained(model_id)
-    #     config.save_pretrained(args.ov_model_path)
-    # else:
-    #     print("[WARNING]: Tokenizer and config.json were not saved because model_id was not found or provided as an option.")
+    if model_id:
+        print(f"save tokenzier to '{args.ov_model_path}' ...")
+        save_tokenzier(model_id, args.ov_model_path)
+        config = AutoConfig.from_pretrained(model_id)
+        config.save_pretrained(args.ov_model_path)
+    else:
+        print("[WARNING]: Tokenizer and config.json were not saved because model_id was not found or provided as an option.")
