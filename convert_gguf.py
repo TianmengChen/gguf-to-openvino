@@ -18,13 +18,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 OV_XML_FILE_NAME="openvino_model.xml"
 
-class QType(Enum):
-    FP16 = 1
-    INT8 = 2
-    INT4 = 3
-
 GGML_QUANTIZATION_GROUP_SIZE = 32
-
 
 def show_model(m):
     print("inputs of the model:")
@@ -453,11 +447,11 @@ def make_int4_weights(key, consts, reorder, head_size):
 
 
 def make_weights_subgraph(key, consts, qtype, reorder, head_size):
-    if qtype == QType.FP16:
+    if "FP16" in qtype:
         final_node = make_fp16_weights(key, consts, reorder, head_size)
-    elif qtype == QType.INT8:
+    elif "Q8_0" in qtype:
         final_node = make_int8_weights(key, consts, reorder, head_size)
-    elif qtype == QType.INT4:
+    elif "Q4_0" in qtype:
         final_node = make_int4_weights(key, consts, reorder, head_size)
     else:
         raise ValueError("Unsupported quantization type:")
@@ -480,7 +474,7 @@ def make_lm_head(key, input, consts, embeddings_node, qtype):
         if consts.get(f"{key}.scales", None) is not None:
             lm_head_qtype = qtype
         else:
-            lm_head_qtype = QType.FP16
+            lm_head_qtype = "FP16"
         w_f32 = make_weights_subgraph(key, consts, lm_head_qtype, False, -1)
     else:
         w_f32 = embeddings_node # shared weights with embeddings
@@ -517,7 +511,7 @@ def make_embedding(key, input, consts, qtype):
     if consts.get(f"{key}.scales", None) is not None:
         embedding_type = qtype
     else:
-        embedding_type = QType.FP16
+        embedding_type = "FP16"
     embed_f32 = make_weights_subgraph(key, consts, embedding_type, False, -1)
     input_int32 = opset.convert(input, Type.i32)
     inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)
@@ -543,9 +537,9 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
     # layerNorm operation
     input_layernorm = make_rms_norm(f"model.layers.{layer_idx}.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
-    q = make_fc(f"model.layers.{layer_idx}.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], False, configs["head_size"])
-    k = make_fc(f"model.layers.{layer_idx}.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"], False, configs["head_size"])
-    v = make_fc(f"model.layers.{layer_idx}.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], configs["qtype"])
+    q = make_fc(f"model.layers.{layer_idx}.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], config["file_type"], False, configs["head_size"])
+    k = make_fc(f"model.layers.{layer_idx}.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], config["file_type"], False, configs["head_size"])
+    v = make_fc(f"model.layers.{layer_idx}.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], config["file_type"])
 
     input_shape = opset.shape_of(input_layernorm)
     if output_shape is None:
@@ -571,18 +565,18 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
                         beam_idx=beam_idx,
                         cos_sin_cached=cos_sin_cached)
 
-    attn_output = make_fc(f"model.layers.{layer_idx}.self_attn.o_proj", attn_output, consts["layers"][layer_idx], configs["qtype"])
+    attn_output = make_fc(f"model.layers.{layer_idx}.self_attn.o_proj", attn_output, consts["layers"][layer_idx], config["file_type"])
 
     attn_output = opset.add(hidden_states, attn_output, auto_broadcast="numpy", name=f"{name_prefix}.add0{name_suffix}")
     post_attention_layernorm = make_rms_norm(f"model.layers.{layer_idx}.post_attention_layernorm", attn_output, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
     # mlp
     def mlp(states):
-        gate_proj = make_fc(f"model.layers.{layer_idx}.mlp.gate_proj", states, consts["layers"][layer_idx], configs["qtype"])
+        gate_proj = make_fc(f"model.layers.{layer_idx}.mlp.gate_proj", states, consts["layers"][layer_idx], config["file_type"])
         silu = opset.swish(gate_proj)
-        up_proj = make_fc(f"model.layers.{layer_idx}.mlp.up_proj", states, consts["layers"][layer_idx], configs["qtype"])
+        up_proj = make_fc(f"model.layers.{layer_idx}.mlp.up_proj", states, consts["layers"][layer_idx], config["file_type"])
         mul = opset.multiply(silu, up_proj, auto_broadcast="numpy", name=f"{name_prefix}.mlp.mul{name_suffix}")
-        down_proj = make_fc(f"model.layers.{layer_idx}.mlp.down_proj", mul, consts["layers"][layer_idx], configs["qtype"])
+        down_proj = make_fc(f"model.layers.{layer_idx}.mlp.down_proj", mul, consts["layers"][layer_idx], config["file_type"])
         return down_proj
 
     mlp_output = mlp(post_attention_layernorm)
@@ -611,7 +605,7 @@ def create_model(configs, consts):
     # [batch, max_kv_len]
     beam_idx = opset.parameter([-1], Type.i32, name="beam_idx")
 
-    inputs_embeds, embeddings = make_embedding("model.embed_tokens", input_ids, consts, configs["qtype"])
+    inputs_embeds, embeddings = make_embedding("model.embed_tokens", input_ids, consts, configs["model.embed_tokens.weight"+"_qtype"])
     hidden_states = inputs_embeds
     
     rope_const = init_rope(configs["head_size"], configs["max_position_embeddings"], configs["rope_freq_base"])
@@ -633,8 +627,7 @@ def create_model(configs, consts):
     # final_layernorm
     final_layernorm = make_rms_norm("model.norm", hidden_states, consts, configs["rms_norm_eps"])
     # embed_out
-    embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings, QType.INT8)#TODO
-    # embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings, configs["qtype"])
+    embed_out = make_lm_head("lm_head", final_layernorm, consts, embeddings, config["lm_head.weight"+"_qtype"])#TODO
     logits = opset.result(embed_out, name="logits")
     logits.set_friendly_name("logits")
     cost = time.time() - beg
@@ -652,17 +645,19 @@ def create_model(configs, consts):
 
 def get_quantizaiton_type(gguf_type):
     if gguf_type == 0 or gguf_type == 1:
-        qtype = QType.FP16
+        qtype = "F16"
         print("Working with FP16 model")
     elif gguf_type == 2 or gguf_type == 3:
         # MOSTLY_Q4_0 or MOSTLY_Q4_1
-        qtype = QType.INT4
+        qtype = "Q4_0"
         # print bits value
         print("Working with INT4 quantized model")
     elif gguf_type == 7:
         # MOSTLY_Q8_0 = 7
-        qtype = QType.INT8
+        qtype = "Q8_0"
         print("Working with INT8 quantized model")
+    elif gguf_type == 14:
+        qtype ="Q6_K"
     else:
         qtype = None
         raise ValueError("Using unsupported GGUF quantization")
@@ -679,13 +674,14 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Extract configurations and weights from GGUF model"""
     print(f"extracting from GGUF model '{model_path}'...")
     beg = time.time()
-
+    config = {}
     # Load GGUF model
     with open(model_path, "rb") as f:
         metadata, tensorinfo = pygguf.load_gguf(f)
         weights={}
         for name in tensorinfo: 
-            weight, scales, biases = pygguf.load_gguf_tensor(f, tensorinfo, name)
+            weight, scales, biases, ggml_name = pygguf.load_gguf_tensor(f, tensorinfo, name)
+            config[name+"_qtype"] = ggml_name
             if scales is not None:
                 shape = tensorinfo[name]["shape"]
                 if check_q_layer(name):#TODO                
@@ -707,7 +703,7 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         print("Cannot get model_id to get the config.json and tokenizer")
         model_id = None
     model_id = "Qwen/Qwen2.5-7B-Instruct"
-    config = {
+    config.update({
         "layer_num": metadata["qwen2.block_count"],
         "head_num": metadata["qwen2.attention.head_count"],
         "head_size": metadata["qwen2.embedding_length"] // metadata["qwen2.attention.head_count"],
@@ -717,9 +713,9 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "rotary_dims": 128,
         "rms_norm_eps": metadata["qwen2.attention.layer_norm_rms_epsilon"],
         "rope_freq_base": metadata.get("qwen2.rope.freq_base", np.float32(10000)),
-        "qtype": get_quantizaiton_type(int(metadata["general.file_type"])),
+        "file_type": get_quantizaiton_type(metadata.get("general.file_type")),
         "model_id": model_id,        
-    }
+    })
 
     print("Config:\n", config)
 
@@ -740,6 +736,9 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     if weights.get("output.scales", None) is not None:
         consts["lm_head.scales"] = np.array(weights["output.scales"])
         consts["lm_head.biases"] = np.array(weights["output.biases"])
+    
+    config["model.embed_tokens.weight"+"_qtype"] = config["token_embd.weight"+"_qtype"]
+    config["lm_head.weight"+"_qtype"] = config["output.weight"+"_qtype"]
     
     # Extract layer weights
     print("Extract layer weights")
@@ -765,7 +764,7 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
             f"model.layers.{i}.mlp.down_proj.bias": None,
             f"model.layers.{i}.mlp.down_proj.weight": np.array(weights[f"blk.{i}.ffn_down.weight"])
         }
-        if config["qtype"] != QType.FP16:
+        if not ("F16" in config["file_type"] or "F32" in config["file_type"]):
             q_weights = {
                 f"model.layers.{i}.self_attn.q_proj.scales": np.array(weights[f"blk.{i}.attn_q.scales"]),
                 f"model.layers.{i}.self_attn.k_proj.scales": np.array(weights[f"blk.{i}.attn_k.scales"]),
