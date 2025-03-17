@@ -388,12 +388,12 @@ def make_q6k_int8_weights(key, consts, reorder, head_size):
         scale = reorder_interleaved_format(scale, head_size)
         bias = reorder_interleaved_format(bias, head_size)
 
-    weights = opset.constant(weight, dtype=np.int8)
+    weights = opset.constant(weight, dtype=np.uint8)
     weights.set_friendly_name(name=f"{key}.weight")
     weights_f16 = opset.convert(weights, Type.f16)
 
-    zero_point = (-bias / scale).astype(np.int8)
-    zero_points = opset.constant(zero_point, dtype=np.int8)
+    zero_point = (-bias / scale).astype(np.uint8)
+    zero_points = opset.constant(zero_point, dtype=np.uint8)
     zero_points_f16 = opset.convert(zero_points, Type.f16)
 
     scales = opset.constant(scale, dtype=np.float16)

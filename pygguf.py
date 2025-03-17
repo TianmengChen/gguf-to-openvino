@@ -326,8 +326,8 @@ def load_q6_k(data):
 
     scales = data_f16[:, -1].reshape(num_blocks, 1).astype(np.float32)
     # TODO use uint8 and cast later?
-    ql = data_u8[:, :128].astype(np.int8)
-    qh = data_u8[:, 128:192].astype(np.int8)
+    ql = data_u8[:, :128].astype(np.uint8)
+    qh = data_u8[:, 128:192].astype(np.uint8)
     sc = data_i8[:, 192:208, np.newaxis].astype(np.float32)
 
     # Unpack bits, subtraction requires signed data type
@@ -340,14 +340,14 @@ def load_q6_k(data):
     # q7 = (ql[:, 64:96 ] >>  4) | (((qh[:, 32:] >> 4) & 3) << 4) - 32
     # q8 = (ql[:, 96:128] >>  4) | (((qh[:, 32:] >> 6) & 3) << 4) - 32
 
-    q1 = (ql[:,   :32 ] & 0xF) | (((qh[:, :32] >> 0) & 3) << 4) - 32
-    q2 = (ql[:, 32:64 ] & 0xF) | (((qh[:, :32] >> 2) & 3) << 4) - 32 
-    q3 = (ql[:,   :32 ] >>  4) | (((qh[:, :32] >> 4) & 3) << 4) - 32 
-    q4 = (ql[:, 32:64 ] >>  4) | (((qh[:, :32] >> 6) & 3) << 4) - 32
-    q5 = (ql[:, 64:96 ] & 0xF) | (((qh[:, 32:] >> 0) & 3) << 4) - 32
-    q6 = (ql[:, 96:128] & 0xF) | (((qh[:, 32:] >> 2) & 3) << 4) - 32
-    q7 = (ql[:, 64:96 ] >>  4) | (((qh[:, 32:] >> 4) & 3) << 4) - 32
-    q8 = (ql[:, 96:128] >>  4) | (((qh[:, 32:] >> 6) & 3) << 4) - 32
+    q1 = (ql[:,   :32 ] & 0xF) | (((qh[:, :32] >> 0) & 3) << 4)
+    q2 = (ql[:, 32:64 ] & 0xF) | (((qh[:, :32] >> 2) & 3) << 4)
+    q3 = (ql[:,   :32 ] >>  4) | (((qh[:, :32] >> 4) & 3) << 4)
+    q4 = (ql[:, 32:64 ] >>  4) | (((qh[:, :32] >> 6) & 3) << 4)
+    q5 = (ql[:, 64:96 ] & 0xF) | (((qh[:, 32:] >> 0) & 3) << 4)
+    q6 = (ql[:, 96:128] & 0xF) | (((qh[:, 32:] >> 2) & 3) << 4)
+    q7 = (ql[:, 64:96 ] >>  4) | (((qh[:, 32:] >> 4) & 3) << 4)
+    q8 = (ql[:, 96:128] >>  4) | (((qh[:, 32:] >> 6) & 3) << 4)
 
     scales = scales * np.concatenate([
         sc[:,  0],
@@ -387,7 +387,7 @@ def load_q6_k(data):
         q8[:, 16:],
     ], axis=1)
 
-    biases = np.full(scales.shape, 0.0).astype(np.float32)
+    biases = -32.0*scales
     # Dequantize
     return weights, scales, biases
 
