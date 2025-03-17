@@ -385,7 +385,6 @@ def make_fp16_weights(key, consts, reorder, head_size):
 
 def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weight, weight.shape, const_dtype)
     weight = consts[f"{key}.weight"]
-    print("------------------------------------",key)
     # weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
     weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE)
@@ -430,7 +429,6 @@ def make_int4_weights(key, consts, reorder, head_size):
         bias = reorder_interleaved_format(bias, head_size)
 
     shape = (orig_weight_shape[0], orig_weight_shape[1]//GGML_QUANTIZATION_GROUP_SIZE, GGML_QUANTIZATION_GROUP_SIZE)
-
     weight_tensor = ov.Tensor(weight.reshape(-1), shape, Type.u4)
     weights = opset.constant(weight_tensor, name=f"{key}.weight", shared_memory=False) # Don't use shared_memory=True
     weights_f16 = opset.convert(weights, Type.f16)
@@ -445,18 +443,16 @@ def make_int4_weights(key, consts, reorder, head_size):
     zero_points = opset.constant(zero_point_tensor, shared_memory=False) # Don't use shared_memory=True
     zero_points_f16 = opset.convert(zero_points, Type.f16)
 
-    scales = opset.constant(scale, dtype=np.float16)
+    scales = opset.constant(scale, dtype=np.float16, shared_memory=False)
 
     w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy")
     w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy")
-    w_zp_s = weights_f16
     w_zp_s_r = opset.reshape(w_zp_s, opset.constant(orig_weight_shape, dtype=np.int64), special_zero=False)
     w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32)
     return w_zp_s_f32
 
 
 def make_weights_subgraph(key, consts, qtype, reorder, head_size):
-    # final_node = make_fp16_weights(key, consts, reorder, head_size)
     if qtype == QType.FP16:
         final_node = make_fp16_weights(key, consts, reorder, head_size)
     elif qtype == QType.INT8:
