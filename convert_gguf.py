@@ -376,6 +376,9 @@ def make_fp16_weights(key, consts, reorder, head_size):
     w_f32 = opset.convert(weights, Type.f32)
     return w_f32
 
+# def make_q6k_int8_weights(key, consts, reorder, head_size):
+
+
 
 def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weight, weight.shape, const_dtype)
     weight = consts[f"{key}.weight"]
@@ -453,6 +456,9 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
         final_node = make_int8_weights(key, consts, reorder, head_size)
     elif "Q4_0" in qtype:
         final_node = make_int4_weights(key, consts, reorder, head_size)
+    elif "Q6_K" in qtype:
+        # final_node = make_q6k_int8_weights(key, consts, reorder, head_size)
+        final_node = make_fp16_weights(key, consts, reorder, head_size)
     else:
         raise ValueError("Unsupported quantization type:")
     
@@ -656,7 +662,7 @@ def get_quantizaiton_type(gguf_type):
         # MOSTLY_Q8_0 = 7
         qtype = "Q8_0"
         print("Working with INT8 quantized model")
-    elif gguf_type == 14:
+    elif gguf_type == 18:
         qtype ="Q6_K"
     else:
         qtype = None
@@ -682,8 +688,8 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         for name in tensorinfo: 
             weight, scales, biases, ggml_name = pygguf.load_gguf_tensor(f, tensorinfo, name)
             config[name+"_qtype"] = ggml_name
+            shape = tensorinfo[name]["shape"]
             if scales is not None:
-                shape = tensorinfo[name]["shape"]
                 if check_q_layer(name):#TODO                
                     weights[name] = weight.reshape([shape[0], -1])
                     weights[name.replace(".weight", ".scales")] = scales.reshape([shape[0], -1])
@@ -693,9 +699,12 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
                     weights[name.replace(".weight", ".scales")] = scales.reshape([shape[-1], -1])
                     weights[name.replace(".weight", ".biases")] = biases.reshape([shape[-1], -1])
             else:
-                weights[name] = weight
+                if name == "output.weight":
+                    weights[name] = weight.reshape([shape[-1], -1])
+                else:
+                    weights[name] = weight
 
-    print("Metadata:\n", metadata.keys())
+    # print("Metadata:\n", metadata.keys())
     try:
         url_parts = metadata["general.source.url"].split("/")
         model_id = f"{url_parts[-2]}/{url_parts[-1]}"
@@ -717,7 +726,7 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "model_id": model_id,        
     })
 
-    print("Config:\n", config)
+    # print("Config:\n", config)
 
     # Extract weights and biases
     print("Extract weights and biases")
@@ -788,8 +797,8 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
     
     cost = time.time() - beg
     print(f"extracting done, cost {cost:.2f} seconds.\nmodel configs:")
-    for k, v in config.items():
-        print(f"{k}: {v}")
+    # for k, v in config.items():
+    #     print(f"{k}: {v}")
     return config, consts
 
 

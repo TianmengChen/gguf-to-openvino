@@ -6,6 +6,7 @@ import numpy as np
 
 GGML_TYPES = {
     "F32": 0,
+    "F16": 1,
     "Q4_0": 2,
     "Q5_0": 6,
     "Q8_0": 8,
@@ -150,7 +151,7 @@ def load_gguf(f):
 
     return info, tensorinfo
 
-def dequantize_q2_k(data):
+def load_q2_k(data):
     # C implementation
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c#L1547
     # C struct definition
@@ -187,7 +188,7 @@ def dequantize_q2_k(data):
 
     return d * (scales & 15) * (tmp & 3) - dmin * (scales >> 4)
 
-def dequantize_q3_k(data):
+def load_q3_k(data):
     # C implementation
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c#L1723C32-L1723C42
     # C struct definition
@@ -229,7 +230,7 @@ def dequantize_q3_k(data):
         (((qs[:, 48:64] >> 6) & 3) - bits[:, 16:, 7])
     ], axis=1)
 
-def dequantize_q4_k(data):
+def load_q4_k(data):
     # C implementation
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c#L1929
     # C struct definition
@@ -255,7 +256,7 @@ def dequantize_q4_k(data):
     # Dequantize final weights using scales and offsets
     return factors * qs2 - offsets
 
-def dequantize_q5_k(data):
+def load_q5_k(data):
     # C implementation
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c#L2129
     # C struct definition
@@ -311,7 +312,7 @@ def dequantize_q5_k(data):
         d8 * (qs_hi_4[:, 3] + (bits[:, :, 7] << 4)) - m8,
     ], axis=1)
 
-def dequantize_q6_k(data):
+def load_q6_k(data):
     # C implementation
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c#L2275
     # C struct definition
@@ -359,7 +360,7 @@ def dequantize_q6_k(data):
         sc[:, 15] * q8[:, 16:],
     ], axis=1), None, None
 
-# def dequantize_q4_0_origin(data):
+# def load_q4_0_origin(data):
 #     # C implementation
 #     # https://github.com/ggerganov/ggml/blob/a3c0188a4b5d3dec052ff87c9f773baa53631d70/src/ggml-quants.c#L1515
 #     # C struct definition
@@ -395,7 +396,7 @@ def unpack_32_4(qs):
 
     return dst
 
-def dequantize_q4_0(data):
+def load_q4_0(data):
     # C implementation
     # https://github.com/ggerganov/ggml/blob/a3c0188a4b5d3dec052ff87c9f773baa53631d70/src/ggml-quants.c#L1515
     # C struct definition
@@ -408,7 +409,7 @@ def dequantize_q4_0(data):
     weights = unpack_32_4(qs)
     return weights, scales, biases
 
-def dequantize_q5_0(data):
+def load_q5_0(data):
     # C implementation
     # https://github.com/ggerganov/ggml/blob/a3c0188a4b5d3dec052ff87c9f773baa53631d70/src/ggml-quants.c#L1556
     # C struct definition
@@ -429,12 +430,12 @@ def dequantize_q5_0(data):
         scales * x1,
     ], axis=1)
 
-def dequantize_q8_0(data):
+def load_q8_0(data):
     # C struct definition
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.h#L43
     num_blocks = len(data) // GGML_BLOCK_SIZES["Q8_0"]
 
-    scales = np.frombuffer(data, dtype=np.float16).reshape(num_blocks, 1 + 16)[:, :1].astype(np.float32)
+    scales = np.frombuffer(data, dtype=np.float16).reshape(num_blocks, 1 + 16)[:, :1].astype(np.float16)
     biases = -128.0 * scales
     weights = np.frombuffer(data, dtype=np.uint8).reshape(num_blocks, 2 + 32)[:, 2:]
     weights = np.copy(weights)
@@ -442,19 +443,19 @@ def dequantize_q8_0(data):
 
     return weights, scales, biases
 
-def dequantize_f32(data):
+def load_f32(data):
     return np.frombuffer(data, dtype=np.float32), None, None
 
-GGML_DEQUANTIZE = {
-    "F32": dequantize_f32,
-    "Q4_0": dequantize_q4_0,
-    # "Q5_0": dequantize_q5_0,
-    "Q8_0": dequantize_q8_0,
-    # "Q2_K": dequantize_q2_k,
-    # "Q3_K": dequantize_q3_k,
-    # "Q4_K": dequantize_q4_k,
-    # "Q5_K": dequantize_q5_k,
-    "Q6_K": dequantize_q6_k,
+GGML_LOAD = {
+    "F32": load_f32,
+    "Q4_0": load_q4_0,
+    # "Q5_0": load_q5_0,
+    "Q8_0": load_q8_0,
+    # "Q2_K": load_q2_k,
+    # "Q3_K": load_q3_k,
+    # "Q4_K": load_q4_k,
+    # "Q5_K": load_q5_k,
+    "Q6_K": load_q6_k,
 }
 
 def load_gguf_tensor(f, tensorinfo, name):
@@ -463,14 +464,14 @@ def load_gguf_tensor(f, tensorinfo, name):
     offset = t["offset"]
     shape = t["shape"]
     ggml_type = t["ggml_type"]
-
+    
     if ggml_type not in GGML_NAMES:
         raise NotImplementedError(f"ggml_type {ggml_type} not implemented")
 
     ggml_name = GGML_NAMES[ggml_type]
     block_size = GGML_BLOCK_SIZES[ggml_name]
     elements_per_block = GGML_ELEMENTS_PER_BLOCK[ggml_name]
-    dequantize = GGML_DEQUANTIZE[ggml_name]
+    loadf = GGML_LOAD[ggml_name]
 
     num_elements = np.prod(shape)
 
@@ -478,9 +479,9 @@ def load_gguf_tensor(f, tensorinfo, name):
 
     size = num_elements * block_size // elements_per_block
     data = f.read(size)
-    weights, scales, biases = dequantize(data)
+    weights, scales, biases = loadf(data)
     
-    return weights, scales, biases
+    return weights, scales, biases, ggml_name
     if scales is not None:
         return weights.reshape([shape[0], shape[1]//2]), scales.reshape([shape[0], shape[1]//elements_per_block]), biases.reshape([shape[0], shape[1]//elements_per_block])
     else: return weights.reshape(shape[::-1]), None, None
