@@ -405,6 +405,37 @@ def make_q6k_int8_weights(key, consts, reorder, head_size):
     w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32)
     return w_zp_s_f32
 
+def make_q4k_int8_weights(key, consts, reorder, head_size):
+
+    weight = consts[f"{key}.weight"]
+    # weight = weight.view(np.uint8)
+    orig_weight_shape = list(weight.shape)
+    num_blocks = orig_weight_shape[0] * orig_weight_shape[1] // 256 # 1215488
+    weight = weight.reshape(num_blocks, 8, 32)
+
+    scale = np.expand_dims(consts[f"{key}.scales"].reshape(-1, 8), axis=2)
+    bias = np.expand_dims(consts[f"{key}.biases"].reshape(-1, 8), axis=2)
+
+    if reorder:
+        weight = reorder_interleaved_format(weight, head_size)
+        scale = reorder_interleaved_format(scale, head_size)
+        bias = reorder_interleaved_format(bias, head_size)
+
+    weights = opset.constant(weight, dtype=np.uint8, shared_memory=False)
+    weights.set_friendly_name(name=f"{key}.weight")
+    weights_f16 = opset.convert(weights, Type.f16)
+
+    bias = opset.constant(bias, dtype=np.float16, shared_memory=False)
+    scales = opset.constant(scale, dtype=np.float16, shared_memory=False)
+
+    w_s = opset.multiply(weights_f16, scales, auto_broadcast="numpy")
+    w_zp_s = opset.subtract(w_s, bias, auto_broadcast="numpy")
+
+    w_zp_s_r = opset.reshape(w_zp_s, opset.constant(orig_weight_shape, dtype=np.int64), special_zero=False)
+    w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32)
+    
+    return w_zp_s_f32
+
 
 def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weight, weight.shape, const_dtype)
     weight = consts[f"{key}.weight"]
@@ -436,9 +467,73 @@ def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weigh
     return w_zp_s_f32
 
 
+def make_q4k_int4_weights(key, consts, reorder, head_size):
+    weight = consts[f"{key}.weight"]
+    # print(f"{key}.weight")
+    # print("original shape: ", weight.shape) # original shape:  (151936, 1024) uint32
+    # weight = weight.view(np.uint8)
+
+    orig_weight_shape = list(weight.shape)
+    orig_weight_shape[1] = orig_weight_shape[1] * 2 # double number of columns as it is 4-bit tensor
+
+    num_blocks = orig_weight_shape[0] * orig_weight_shape[1] // 256 # 1215488
+    # print("num_blocks: ", num_blocks)
+    # GGML_QUANTIZATION_GROUP_SIZE = 256 # only for q4k
+    # weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE//2)
+
+    scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
+    bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
+    # print("scale shape: ", scale.shape) # (151936, 64, 1)
+
+    if reorder:
+        weight = reorder_interleaved_format(weight, head_size)
+        scale = reorder_interleaved_format(scale, head_size)
+        bias = reorder_interleaved_format(bias, head_size)
+    # scale = np.where(scale == 0, 1e-8, scale) # RuntimeWarning: divide by zero encountered in divide
+    # scale:  (151936, 64, 1) float32
+    # zero_point:  (151936, 64, 1) uint8
+    # print("scale: ", scale.shape, scale.dtype)
+    zero_point = (-bias / scale).astype(np.uint8)
+    # print("zero_point: ", zero_point.shape, zero_point.dtype)
+
+    # zero_point_shape = list(zero_point.shape) # (151936, 64, 1)
+    # shape = (orig_weight_shape[0], orig_weight_shape[1]//GGML_QUANTIZATION_GROUP_SIZE, GGML_QUANTIZATION_GROUP_SIZE)
+    shape = (num_blocks, 8, 32)
+    zp_shape = (num_blocks, 8, 1)
+
+    weight_tensor = ov.Tensor(weight.reshape(-1), shape, Type.u4)
+    weights = opset.constant(weight_tensor, name=f"{key}.weight", shared_memory=False) # Don't use shared_memory=True
+    weights_f16 = opset.convert(weights, Type.f16)
+    # print("weights_f16: ", weights_f16) #   
+
+    zero_point = zero_point.reshape(-1)
+    # Pack zero points: two subsequent values into one
+    mask = np.array(0b00001111, dtype=np.uint8)
+    zero_point_packed = (zero_point[1::2] << 4) | (zero_point[0::2] & mask)
+    zero_point_tensor = ov.Tensor(zero_point_packed, zp_shape, Type.u4)
+    zero_points = opset.constant(zero_point_tensor, shared_memory=False) # Don't use shared_memory=True
+    zero_points_f16 = opset.convert(zero_points, Type.f16, name=f"{key}.zp_tensor_convert") 
+    scale = scale.reshape(num_blocks, 8, 1)
+    scales = opset.constant(scale, dtype=np.float16, shared_memory=False, name=f"{key}.scales")
+
+    w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy", name=f"{key}.w_zp_subtract") # (num_blocks, 8, 1)
+    # print(w_zp)
+    # print(scales)
+    w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy", name=f"{key}.w_zp_multiply")
+    # print(w_zp.shape, scales.shape, w_zp_s.shape) # [1215488,8,32] [1215488,8,1] [1215488,8,32]
+    # print(w_zp_s.shape, orig_weight_shape) # [1215488,8,32] [151936, 2048]
+
+    w_zp_s_r = opset.reshape(w_zp_s, opset.constant(orig_weight_shape, dtype=np.int64), special_zero=False)
+    w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32, name=f"{key}.w_zp_f32_convert")
+    # print("w_zp_s_f32:", w_zp_s_f32)
+    return w_zp_s_f32
+
 def make_int4_weights(key, consts, reorder, head_size):
     weight = consts[f"{key}.weight"]
     # weight = weight.view(np.uint8)
+    # print(f"{key}.weight") # checked pygguf with mlx
+    # print(weight, weight.dtype)
+    
     orig_weight_shape = list(weight.shape)
     orig_weight_shape[1] = orig_weight_shape[1] * 2 # double number of columns as it is 4-bit tensor
 
@@ -474,8 +569,8 @@ def make_int4_weights(key, consts, reorder, head_size):
     w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32)
     return w_zp_s_f32
 
-
 def make_weights_subgraph(key, consts, qtype, reorder, head_size):
+    # print("===", qtype)
     if "FP16" in qtype:
         final_node = make_fp16_weights(key, consts, reorder, head_size)
     elif "Q8_0" in qtype:
@@ -484,6 +579,13 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
         final_node = make_int4_weights(key, consts, reorder, head_size)
     elif "Q6_K" in qtype:
         final_node = make_q6k_int8_weights(key, consts, reorder, head_size)
+    elif "Q4_K" in qtype:
+        if key == "model.embed_tokens":
+            final_node = make_q4k_int8_weights(key, consts, reorder, head_size)
+            # final_node = make_q4k_int4_weights(key, consts, reorder, head_size)
+        else:
+            final_node = make_q4k_int8_weights(key, consts, reorder, head_size)
+            # final_node = make_q4k_int4_weights(key, consts, reorder, head_size) # still have bug
     else:
         raise ValueError("Unsupported quantization type:")
     
@@ -493,10 +595,10 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
 def make_fc(key, input, consts, qtype, reorder=False, head_size=-1):
     # weight const f32 NxK
     w_f32 = make_weights_subgraph(key, consts, qtype, reorder, head_size)
-    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
+    matmul = opset.matmul(input, w_f32, transpose_a=False, transpose_b=True, name=f"{key}.make_fc_matmul")
     if consts[f"{key}.bias"] is not None:
         bias = opset.constant(consts[f"{key}.bias"], Type.f32)
-        matmul = opset.add(matmul, bias, auto_broadcast="numpy")
+        matmul = opset.add(matmul, bias, auto_broadcast="numpy", name=f"{key}.make_fc_add")
     return matmul
 
 
@@ -509,7 +611,7 @@ def make_lm_head(key, input, consts, embeddings_node, qtype):
         w_f32 = make_weights_subgraph(key, consts, lm_head_qtype, False, -1)
     else:
         w_f32 = embeddings_node # shared weights with embeddings
-    return opset.matmul(input, w_f32, transpose_a=False, transpose_b=True)
+    return opset.matmul(input, w_f32, transpose_a=False, transpose_b=True, name=f"{key}.matmul")
 
 
 def make_mvn(key, input, consts, configs, name_suffix=""):
@@ -530,10 +632,10 @@ def make_rms_norm(key, input, consts, epsilon):
     add = opset.add(variance, opset.convert(epsilon_c, Type.f32))
     sqrt = opset.sqrt(add)
     div = opset.divide(opset.convert(opset.constant([[[1]]], dtype=np.float16), Type.f32), sqrt)
-    mul = opset.multiply(div, input, auto_broadcast="numpy")
+    mul = opset.multiply(div, input, auto_broadcast="numpy", name=f"{key}.multiply_divide")
     if not np.all(consts[f"{key}.weight"] == 1.0):
         weights = opset.convert(opset.constant(consts[f"{key}.weight"].reshape((1, 1, -1)), np.float16), Type.f32)
-        mul = opset.multiply(mul, weights, auto_broadcast="numpy")
+        mul = opset.multiply(mul, weights, auto_broadcast="numpy", name=f"{key}.multiply_mul")
 
     return mul
 
@@ -546,6 +648,8 @@ def make_embedding(key, input, consts, qtype):
     embed_f32 = make_weights_subgraph(key, consts, embedding_type, False, -1)
     input_int32 = opset.convert(input, Type.i32)
     inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)
+    # print("stop in make_embedding")
+    # exit()
     return inputs_embeds, embed_f32
 
 
@@ -567,10 +671,10 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
     name_prefix = "model.layers.self_attn"
     # layerNorm operation
     input_layernorm = make_rms_norm(f"model.layers.{layer_idx}.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"])
-
-    q = make_fc(f"model.layers.{layer_idx}.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], config["file_type"], False, configs["head_size"])
-    k = make_fc(f"model.layers.{layer_idx}.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], config["file_type"], False, configs["head_size"])
-    v = make_fc(f"model.layers.{layer_idx}.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], config["file_type"])
+    # pass weight_qtype(ggml_name/gguf_type) instead of file_type
+    q = make_fc(f"model.layers.{layer_idx}.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_q.weight_qtype"], False, configs["head_size"])
+    k = make_fc(f"model.layers.{layer_idx}.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_k.weight_qtype"], False, configs["head_size"])
+    v = make_fc(f"model.layers.{layer_idx}.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_v.weight_qtype"])
 
     input_shape = opset.shape_of(input_layernorm)
     if output_shape is None:
@@ -596,18 +700,18 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
                         beam_idx=beam_idx,
                         cos_sin_cached=cos_sin_cached)
 
-    attn_output = make_fc(f"model.layers.{layer_idx}.self_attn.o_proj", attn_output, consts["layers"][layer_idx], config["file_type"])
+    attn_output = make_fc(f"model.layers.{layer_idx}.self_attn.o_proj", attn_output, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_output.weight_qtype"])
 
     attn_output = opset.add(hidden_states, attn_output, auto_broadcast="numpy", name=f"{name_prefix}.add0{name_suffix}")
     post_attention_layernorm = make_rms_norm(f"model.layers.{layer_idx}.post_attention_layernorm", attn_output, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
     # mlp
     def mlp(states):
-        gate_proj = make_fc(f"model.layers.{layer_idx}.mlp.gate_proj", states, consts["layers"][layer_idx], config["file_type"])
+        gate_proj = make_fc(f"model.layers.{layer_idx}.mlp.gate_proj", states, consts["layers"][layer_idx], config[f"blk.{layer_idx}.ffn_gate.weight_qtype"])
         silu = opset.swish(gate_proj)
-        up_proj = make_fc(f"model.layers.{layer_idx}.mlp.up_proj", states, consts["layers"][layer_idx], config["file_type"])
+        up_proj = make_fc(f"model.layers.{layer_idx}.mlp.up_proj", states, consts["layers"][layer_idx], config[f"blk.{layer_idx}.ffn_up.weight_qtype"])
         mul = opset.multiply(silu, up_proj, auto_broadcast="numpy", name=f"{name_prefix}.mlp.mul{name_suffix}")
-        down_proj = make_fc(f"model.layers.{layer_idx}.mlp.down_proj", mul, consts["layers"][layer_idx], config["file_type"])
+        down_proj = make_fc(f"model.layers.{layer_idx}.mlp.down_proj", mul, consts["layers"][layer_idx], config[f"blk.{layer_idx}.ffn_down.weight_qtype"])
         return down_proj
 
     mlp_output = mlp(post_attention_layernorm)
@@ -689,6 +793,9 @@ def get_quantizaiton_type(gguf_type):
         print("Working with INT8 quantized model")
     elif gguf_type == 18:
         qtype ="Q6_K"
+    elif gguf_type == 15: 
+        # MOSTLY_Q4_K_M == 15
+        qtype = "Q4_K"
     else:
         qtype = None
         raise ValueError("Using unsupported GGUF quantization")
@@ -712,14 +819,18 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         weights={}
         for name in tensorinfo: 
             weight, scales, biases, ggml_name = pygguf.load_gguf_tensor(f, tensorinfo, name)
+            # print(name, ggml_name)
+
             config[name+"_qtype"] = ggml_name
             shape = tensorinfo[name]["shape"]
+            # print(shape)
             if scales is not None:
-                if check_q_layer(name):#TODO                
+                # print("scales is not None")
+                if check_q_layer(name):#TODO        
                     weights[name] = weight.reshape([shape[0], -1])
                     weights[name.replace(".weight", ".scales")] = scales.reshape([shape[0], -1])
                     weights[name.replace(".weight", ".biases")] = biases.reshape([shape[0], -1])
-                else:                
+                else:
                     weights[name] = weight.reshape([shape[-1], -1])
                     weights[name.replace(".weight", ".scales")] = scales.reshape([shape[-1], -1])
                     weights[name.replace(".weight", ".biases")] = biases.reshape([shape[-1], -1])
@@ -728,7 +839,12 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
                     weights[name] = weight.reshape([shape[-1], -1])
                 else:
                     weights[name] = weight
-
+            # print("----weight", weights[name].shape) # (151936, 2048)
+            # sc_shape = scales.reshape([shape[-1], -1]) # (151936, 64)
+            # print("----scale", sc_shape.shape) # 
+            # if name == "token_embd.weight":
+            #     print("stop after token_embd.weight")
+            #     exit()
     # print("Metadata:\n", metadata.keys())
     try:
         url_parts = metadata["general.source.url"].split("/")

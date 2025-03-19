@@ -230,12 +230,38 @@ def load_q3_k(data):
         (((qs[:, 48:64] >> 6) & 3) - bits[:, 16:, 7])
     ], axis=1)
 
-def load_q4_k(data):
+def load_q4_k_int8(data):
     # C implementation
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c#L1929
     # C struct definition
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.h#L116
-    block_size = GGML_BLOCK_SIZES["Q4_K"]
+    block_size = GGML_BLOCK_SIZES["Q4_K"] # 144
+    num_blocks = len(data) // block_size
+
+    data_f16 = np.frombuffer(data, dtype=np.float16).reshape(num_blocks, block_size // 2)
+    data_u8 = np.frombuffer(data, dtype=np.uint8).reshape(num_blocks, block_size)
+
+    # Casting to float32 because float16 is very slow on CPU
+    scale_factors = data_f16[:, 0].reshape(num_blocks, 1, 1).astype(np.float32)
+    scale_offsets = data_f16[:, 1].reshape(num_blocks, 1, 1).astype(np.float32)
+    qs1 = data_u8[:, 4:16].reshape(num_blocks, 12, 1)
+    qs2 = data_u8[:, 16:].reshape(num_blocks, 4, 32)
+
+    # Dequantize scales and offsets (6 bits and 4 + 2 bits)
+    factors = scale_factors * np.concatenate([qs1[:, 0:4] & 0b111111, (qs1[:, 8:] & 15) | ((qs1[:, 0:4] >> 6) << 4)], axis=1)
+    offsets = scale_offsets * np.concatenate([qs1[:, 4:8] & 0b111111, (qs1[:, 8:] >> 4) | ((qs1[:, 4:8] >> 6) << 4)], axis=1)
+
+    qs2 = np.stack([qs2 & 0xf, qs2 >> 4], axis=2).reshape(num_blocks, 8, 32)
+        
+    return qs2, factors, offsets # offset no "-"
+
+# get 256 4bit
+def load_q4_k_int4(data):
+    # C implementation
+    # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c#L1929
+    # C struct definition
+    # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.h#L116
+    block_size = GGML_BLOCK_SIZES["Q4_K"] # 144
     num_blocks = len(data) // block_size
 
     data_f16 = np.frombuffer(data, dtype=np.float16).reshape(num_blocks, block_size // 2)
@@ -252,9 +278,13 @@ def load_q4_k(data):
     offsets = scale_offsets * np.concatenate([qs1[:, 4:8] & 0b111111, (qs1[:, 8:] >> 4) | ((qs1[:, 4:8] >> 6) << 4)], axis=1)
 
     # Interleave low and high quantized bits
-    qs2 = np.stack([qs2 & 0xf, qs2 >> 4], axis=2).reshape(num_blocks, 8, 32)
-    # Dequantize final weights using scales and offsets
-    return factors * qs2 - offsets
+    # qs2 = np.stack([qs2 & 0xf, qs2 >> 4], axis=2).reshape(num_blocks, 8*32)
+    
+    # align with q4_0's make_int4
+    qs2 = qs2.reshape(num_blocks, 256//2) # 256 4 bit -> 128 uint8 
+    weights = unpack_32_4(qs2)
+
+    return weights, factors, -offsets
 
 def load_q5_k(data):
     # C implementation
@@ -406,26 +436,50 @@ def load_q6_k(data):
 #         scales * ((qs >> 4).astype(np.int8) - 8),
 #     ], axis=1)
 
+# original
+# def unpack_32_4(qs):
+#     # Initialize the output array with zeros
+#     num_blocks = qs.shape[0]
+#     dst = np.zeros((num_blocks, 16), dtype=np.uint8)
+
+#     # Process the lower 4 bits
+#     for j in range(16):
+#         x = qs[:, j] & 0x0F  # Extract lower 4 bits
+#         if j % 2 != 0:
+#             x <<= 4  # Shift left by 4 if j is odd 
+#         dst[:, j // 2] += x
+
+#     # Process the higher 4 bits
+#     for j in range(16):
+#         x = qs[:, j] >> 4  # Extract higher 4 bits
+#         if j % 2 != 0:
+#             x <<= 4  # Shift left by 4 if j is odd
+#         dst[:, 8 + j // 2] += x
+
+#     return dst
+
+# modify to support q4k(256 4bit)
 def unpack_32_4(qs):
     # Initialize the output array with zeros
-    num_blocks = qs.shape[0]
-    dst = np.zeros((num_blocks, 16), dtype=np.uint8)
-
+    num_blocks = qs.shape[0] 
+    dst = np.zeros((num_blocks, qs.shape[1]), dtype=np.uint8)
+    # qs.shape[1] = 128 for q4k
     # Process the lower 4 bits
-    for j in range(16):
+    for j in range(qs.shape[1]): 
         x = qs[:, j] & 0x0F  # Extract lower 4 bits
         if j % 2 != 0:
             x <<= 4  # Shift left by 4 if j is odd 
         dst[:, j // 2] += x
 
     # Process the higher 4 bits
-    for j in range(16):
+    for j in range(qs.shape[1]):
         x = qs[:, j] >> 4  # Extract higher 4 bits
         if j % 2 != 0:
             x <<= 4  # Shift left by 4 if j is odd
         dst[:, 8 + j // 2] += x
 
     return dst
+
 
 def load_q4_0(data):
     # C implementation
@@ -484,7 +538,8 @@ GGML_LOAD = {
     "Q8_0": load_q8_0,
     # "Q2_K": load_q2_k,
     # "Q3_K": load_q3_k,
-    # "Q4_K": load_q4_k,
+    "Q4_K_8": load_q4_k_int8, 
+    "Q4_K": load_q4_k_int8, # load_q4_k_int4 still have bug 
     # "Q5_K": load_q5_k,
     "Q6_K": load_q6_k,
 }
@@ -502,7 +557,12 @@ def load_gguf_tensor(f, tensorinfo, name):
     ggml_name = GGML_NAMES[ggml_type]
     block_size = GGML_BLOCK_SIZES[ggml_name]
     elements_per_block = GGML_ELEMENTS_PER_BLOCK[ggml_name]
-    loadf = GGML_LOAD[ggml_name]
+    if name == "token_embd.weight":
+        ggml_name = "Q4_K_8" # load_q4_k_int8
+        print(ggml_name)
+        loadf = GGML_LOAD[ggml_name]
+    else: 
+        loadf = GGML_LOAD[ggml_name]
 
     num_elements = np.prod(shape)
 
