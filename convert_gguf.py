@@ -18,7 +18,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 OV_XML_FILE_NAME="openvino_model.xml"
 
-GGML_QUANTIZATION_GROUP_SIZE = 32
+# GGML_QUANTIZATION_GROUP_SIZE = 32
 
 def show_model(m):
     print("inputs of the model:")
@@ -376,11 +376,11 @@ def make_fp16_weights(key, consts, reorder, head_size):
     w_f32 = opset.convert(weights, Type.f32)
     return w_f32
 
-def make_q6k_int8_weights(key, consts, reorder, head_size):
+def make_int8_weights(key, consts, reorder, head_size, group_size):#weight = ov.Tensor(weight, weight.shape, const_dtype)
     weight = consts[f"{key}.weight"]
     # weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
-    weight = weight.reshape(orig_weight_shape[0], -1, 16)
+    weight = weight.reshape(orig_weight_shape[0], -1, group_size)
     scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
     bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
     if reorder:
@@ -406,43 +406,13 @@ def make_q6k_int8_weights(key, consts, reorder, head_size):
     return w_zp_s_f32
 
 
-def make_int8_weights(key, consts, reorder, head_size):#weight = ov.Tensor(weight, weight.shape, const_dtype)
-    weight = consts[f"{key}.weight"]
-    # weight = weight.view(np.uint8)
-    orig_weight_shape = list(weight.shape)
-    weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE)
-    scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
-    bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
-    if reorder:
-        weight = reorder_interleaved_format(weight, head_size)
-        scale = reorder_interleaved_format(scale, head_size)
-        bias = reorder_interleaved_format(bias, head_size)
-
-    weights = opset.constant(weight, dtype=np.uint8)
-    weights.set_friendly_name(name=f"{key}.weight")
-    weights_f16 = opset.convert(weights, Type.f16)
-
-    zero_point = (-bias / scale).astype(np.uint8)
-    zero_points = opset.constant(zero_point, dtype=np.uint8)
-    zero_points_f16 = opset.convert(zero_points, Type.f16)
-
-    scales = opset.constant(scale, dtype=np.float16)
-
-    w_zp = opset.subtract(weights_f16, zero_points_f16, auto_broadcast="numpy")
-    w_zp_s = opset.multiply(w_zp, scales, auto_broadcast="numpy")
-
-    w_zp_s_r = opset.reshape(w_zp_s, opset.constant(orig_weight_shape, dtype=np.int64), special_zero=False)
-    w_zp_s_f32 = opset.convert(w_zp_s_r, Type.f32)
-    return w_zp_s_f32
-
-
-def make_int4_weights(key, consts, reorder, head_size):
+def make_int4_weights(key, consts, reorder, head_size, group_size):
     weight = consts[f"{key}.weight"]
     # weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
     orig_weight_shape[1] = orig_weight_shape[1] * 2 # double number of columns as it is 4-bit tensor
 
-    weight = weight.reshape(orig_weight_shape[0], -1, GGML_QUANTIZATION_GROUP_SIZE//2)
+    weight = weight.reshape(orig_weight_shape[0], -1, group_size//2)
     scale = np.expand_dims(consts[f"{key}.scales"], axis=2)
     bias = np.expand_dims(consts[f"{key}.biases"], axis=2)
 
@@ -451,7 +421,7 @@ def make_int4_weights(key, consts, reorder, head_size):
         scale = reorder_interleaved_format(scale, head_size)
         bias = reorder_interleaved_format(bias, head_size)
 
-    shape = (orig_weight_shape[0], orig_weight_shape[1]//GGML_QUANTIZATION_GROUP_SIZE, GGML_QUANTIZATION_GROUP_SIZE)
+    shape = (orig_weight_shape[0], orig_weight_shape[1]//group_size, group_size)
     weight_tensor = ov.Tensor(weight.reshape(-1), shape, Type.u4)
     weights = opset.constant(weight_tensor, name=f"{key}.weight", shared_memory=False) # Don't use shared_memory=True
     weights_f16 = opset.convert(weights, Type.f16)
@@ -479,11 +449,13 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
     if "FP16" in qtype:
         final_node = make_fp16_weights(key, consts, reorder, head_size)
     elif "Q8_0" in qtype:
-        final_node = make_int8_weights(key, consts, reorder, head_size)
+        final_node = make_int8_weights(key, consts, reorder, head_size, 32)
     elif "Q4_0" in qtype:
-        final_node = make_int4_weights(key, consts, reorder, head_size)
+        final_node = make_int4_weights(key, consts, reorder, head_size, 32)
+    elif "Q4_K" in qtype:
+        final_node = make_int4_weights(key, consts, reorder, head_size, 256)
     elif "Q6_K" in qtype:
-        final_node = make_q6k_int8_weights(key, consts, reorder, head_size)
+        final_node = make_int8_weights(key, consts, reorder, head_size, 16)
     else:
         raise ValueError("Unsupported quantization type:")
     
@@ -568,9 +540,9 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
     # layerNorm operation
     input_layernorm = make_rms_norm(f"model.layers.{layer_idx}.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
-    q = make_fc(f"model.layers.{layer_idx}.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], config["file_type"], False, configs["head_size"])
-    k = make_fc(f"model.layers.{layer_idx}.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], config["file_type"], False, configs["head_size"])
-    v = make_fc(f"model.layers.{layer_idx}.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], config["file_type"])
+    q = make_fc(f"model.layers.{layer_idx}.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_q.weight_qtype"], False, configs["head_size"])
+    k = make_fc(f"model.layers.{layer_idx}.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_k.weight_qtype"], False, configs["head_size"])
+    v = make_fc(f"model.layers.{layer_idx}.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_v.weight_qtype"])
 
     input_shape = opset.shape_of(input_layernorm)
     if output_shape is None:
@@ -596,18 +568,19 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
                         beam_idx=beam_idx,
                         cos_sin_cached=cos_sin_cached)
 
-    attn_output = make_fc(f"model.layers.{layer_idx}.self_attn.o_proj", attn_output, consts["layers"][layer_idx], config["file_type"])
+    attn_output = make_fc(f"model.layers.{layer_idx}.self_attn.o_proj", attn_output, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_output.weight_qtype"])
 
     attn_output = opset.add(hidden_states, attn_output, auto_broadcast="numpy", name=f"{name_prefix}.add0{name_suffix}")
     post_attention_layernorm = make_rms_norm(f"model.layers.{layer_idx}.post_attention_layernorm", attn_output, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
     # mlp
     def mlp(states):
-        gate_proj = make_fc(f"model.layers.{layer_idx}.mlp.gate_proj", states, consts["layers"][layer_idx], config["file_type"])
+
+        gate_proj = make_fc(f"model.layers.{layer_idx}.mlp.gate_proj", states, consts["layers"][layer_idx], config[f"blk.{layer_idx}.ffn_gate.weight_qtype"])
         silu = opset.swish(gate_proj)
-        up_proj = make_fc(f"model.layers.{layer_idx}.mlp.up_proj", states, consts["layers"][layer_idx], config["file_type"])
+        up_proj = make_fc(f"model.layers.{layer_idx}.mlp.up_proj", states, consts["layers"][layer_idx], config[f"blk.{layer_idx}.ffn_up.weight_qtype"])
         mul = opset.multiply(silu, up_proj, auto_broadcast="numpy", name=f"{name_prefix}.mlp.mul{name_suffix}")
-        down_proj = make_fc(f"model.layers.{layer_idx}.mlp.down_proj", mul, consts["layers"][layer_idx], config["file_type"])
+        down_proj = make_fc(f"model.layers.{layer_idx}.mlp.down_proj", mul, consts["layers"][layer_idx], config[f"blk.{layer_idx}.ffn_down.weight_qtype"])
         return down_proj
 
     mlp_output = mlp(post_attention_layernorm)
@@ -678,7 +651,7 @@ def get_quantizaiton_type(gguf_type):
     if gguf_type == 0 or gguf_type == 1:
         qtype = "F16"
         print("Working with FP16 model")
-    elif gguf_type == 2 or gguf_type == 3:
+    elif gguf_type == 2 or gguf_type == 3 or gguf_type == 12 or gguf_type == 15:
         # MOSTLY_Q4_0 or MOSTLY_Q4_1
         qtype = "Q4_0"
         # print bits value
@@ -691,7 +664,7 @@ def get_quantizaiton_type(gguf_type):
         qtype ="Q6_K"
     else:
         qtype = None
-        raise ValueError("Using unsupported GGUF quantization")
+        raise ValueError("Using unsupported GGUF quantization: ", gguf_type)
     return qtype
 
 def check_q_layer(name):
@@ -751,7 +724,7 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         "model_id": model_id,        
     })
 
-    # print("Config:\n", config)
+    print("Config:\n", config)
 
     # Extract weights and biases
     print("Extract weights and biases")
