@@ -453,8 +453,8 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
     elif "Q4_0" in qtype:
         final_node = make_int4_weights(key, consts, reorder, head_size, 32)
     elif "Q4_K" in qtype:
-        # final_node = make_int4_weights(key, consts, reorder, head_size, 32)
-        final_node = make_int8_weights(key, consts, reorder, head_size, 32)
+        final_node = make_int4_weights(key, consts, reorder, head_size, 32)
+        # final_node = make_int8_weights(key, consts, reorder, head_size, 32)
     elif "Q6_K" in qtype:
         final_node = make_int8_weights(key, consts, reorder, head_size, 16)
     else:
