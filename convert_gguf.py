@@ -377,6 +377,7 @@ def make_fp16_weights(key, consts, reorder, head_size):
     return w_f32
 
 def make_int8_weights(key, consts, reorder, head_size, group_size):#weight = ov.Tensor(weight, weight.shape, const_dtype)
+    print("int88888888,", key)
     weight = consts[f"{key}.weight"]
     # weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
@@ -517,9 +518,6 @@ def make_embedding(key, input, consts, qtype):
         embedding_type = qtype
     else:
         embedding_type = "FP16"
-
-    if "token" in key and qtype == "Q4_K":
-        embedding_type = "Q4_K_int8"
     embed_f32 = make_weights_subgraph(key, consts, embedding_type, False, -1)
     input_int32 = opset.convert(input, Type.i32)
     inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)
@@ -679,7 +677,7 @@ def check_q_layer(name):
             return True
     return False
 
-def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
+def load_gguf_model(model_path: str, all_layer: bool) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Extract configurations and weights from GGUF model"""
     print(f"extracting from GGUF model '{model_path}'...")
     beg = time.time()
@@ -689,7 +687,7 @@ def load_gguf_model(model_path: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         metadata, tensorinfo = pygguf.load_gguf(f)
         weights={}
         for name in tensorinfo: 
-            weight, scales, biases, ggml_name = pygguf.load_gguf_tensor(f, tensorinfo, name)
+            weight, scales, biases, ggml_name = pygguf.load_gguf_tensor(f, tensorinfo, name, all_layer)
             config[name+"_qtype"] = ggml_name
             shape = tensorinfo[name]["shape"]
             if scales is not None:
@@ -810,11 +808,12 @@ if __name__ == "__main__":
     parser.add_argument("--org_model_path", type=str, default="Model ID (can be a Hugginface Hub id, or a local directory)")
     parser.add_argument("--ov_model_path", type=str, nargs="?", default="./gen/llama-2-7b-chat/")
     parser.add_argument("--model_id", type=str, nargs="?", default=None)
+    parser.add_argument("--all_layer", action='store_true', default=False )
     args = parser.parse_args()
     beg = time.time()
     os.makedirs(args.ov_model_path, exist_ok=True)
 
-    config, consts = load_gguf_model(args.org_model_path)
+    config, consts = load_gguf_model(args.org_model_path, args.all_layer)
     model = create_model(config, consts)
     cost = time.time() - beg
     print(f"convert done, cost {cost:.2f} seconds.")

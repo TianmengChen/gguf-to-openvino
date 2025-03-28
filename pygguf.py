@@ -536,7 +536,7 @@ GGML_LOAD = {
     "Q6_K": load_q6_k,
 }
 
-def load_gguf_tensor(f, tensorinfo, name):
+def load_gguf_tensor(f, tensorinfo, name, all_layer):
     t = tensorinfo[name]
 
     offset = t["offset"]
@@ -550,8 +550,9 @@ def load_gguf_tensor(f, tensorinfo, name):
 
     block_size = GGML_BLOCK_SIZES[ggml_name]
     elements_per_block = GGML_ELEMENTS_PER_BLOCK[ggml_name]
-    if ggml_name == "Q4_K"  and "token_embd" in name:
+    if ggml_name == "Q4_K"  and "token_embd" in name and not all_layer:
         loadf = load_q4_k_int8
+        ggml_name = "Q4_K_int8"
     else:
         loadf = GGML_LOAD[ggml_name]
 
