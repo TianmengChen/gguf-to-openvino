@@ -446,16 +446,17 @@ def make_int4_weights(key, consts, reorder, head_size, group_size):
 
 
 def make_weights_subgraph(key, consts, qtype, reorder, head_size):
-    if "FP16" in qtype:
+    if "FP16" == qtype:
         final_node = make_fp16_weights(key, consts, reorder, head_size)
-    elif "Q8_0" in qtype:
+    elif "Q8_0" == qtype:
         final_node = make_int8_weights(key, consts, reorder, head_size, 32)
-    elif "Q4_0" in qtype:
+    elif "Q4_0" == qtype:
         final_node = make_int4_weights(key, consts, reorder, head_size, 32)
-    elif "Q4_K" in qtype:
+    elif "Q4_K" == qtype:
         final_node = make_int4_weights(key, consts, reorder, head_size, 32)
-        # final_node = make_int8_weights(key, consts, reorder, head_size, 32)
-    elif "Q6_K" in qtype:
+    elif "Q4_K_int8" == qtype:
+        final_node = make_int8_weights(key, consts, reorder, head_size, 32)
+    elif "Q6_K" == qtype:
         final_node = make_int8_weights(key, consts, reorder, head_size, 16)
     else:
         raise ValueError("Unsupported quantization type:")
@@ -516,6 +517,9 @@ def make_embedding(key, input, consts, qtype):
         embedding_type = qtype
     else:
         embedding_type = "FP16"
+
+    if "token" in key and qtype == "Q4_K":
+        embedding_type = "Q4_K_int8"
     embed_f32 = make_weights_subgraph(key, consts, embedding_type, False, -1)
     input_int32 = opset.convert(input, Type.i32)
     inputs_embeds = opset.gather(embed_f32, indices=input_int32, axis=0)

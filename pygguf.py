@@ -547,9 +547,13 @@ def load_gguf_tensor(f, tensorinfo, name):
         raise NotImplementedError(f"ggml_type {ggml_type} not implemented")
 
     ggml_name = GGML_NAMES[ggml_type]
+
     block_size = GGML_BLOCK_SIZES[ggml_name]
     elements_per_block = GGML_ELEMENTS_PER_BLOCK[ggml_name]
-    loadf = GGML_LOAD[ggml_name]
+    if ggml_name == "Q4_K"  and "token_embd" in name:
+        loadf = load_q4_k_int8
+    else:
+        loadf = GGML_LOAD[ggml_name]
 
     num_elements = np.prod(shape)
 
