@@ -252,7 +252,7 @@ def unpack_128_4(qs):
  
     return dst
 
-def load_q4_k(data):
+def load_q4_k_int4(data):
     # C implementation
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c#L1929
     # C struct definition
@@ -278,6 +278,30 @@ def load_q4_k(data):
     # Dequantize final weights using scales and offsets
     weights = unpack_128_4(qs2)
     return weights, scales, biases
+
+def load_q4_k_int8(data):
+    # C implementation
+    # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c#L1929
+    # C struct definition
+    # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.h#L116
+    block_size = GGML_BLOCK_SIZES["Q4_K"] # 144
+    num_blocks = len(data) // block_size
+
+    data_f16 = np.frombuffer(data, dtype=np.float16).reshape(num_blocks, block_size // 2)
+    data_u8 = np.frombuffer(data, dtype=np.uint8).reshape(num_blocks, block_size)
+
+    # Casting to float32 because float16 is very slow on CPU
+    scale_factors = data_f16[:, 0].reshape(num_blocks, 1, 1).astype(np.float32)
+    scale_offsets = data_f16[:, 1].reshape(num_blocks, 1, 1).astype(np.float32)
+    qs1 = data_u8[:, 4:16].reshape(num_blocks, 12, 1)
+    qs2 = data_u8[:, 16:].reshape(num_blocks, 4, 32)
+
+    # Dequantize scales and offsets (6 bits and 4 + 2 bits)
+    factors = scale_factors * np.concatenate([qs1[:, 0:4] & 0b111111, (qs1[:, 8:] & 15) | ((qs1[:, 0:4] >> 6) << 4)], axis=1)
+    offsets = scale_offsets * np.concatenate([qs1[:, 4:8] & 0b111111, (qs1[:, 8:] >> 4) | ((qs1[:, 4:8] >> 6) << 4)], axis=1)
+
+    qs2 = np.stack([qs2 & 0xf, qs2 >> 4], axis=2)
+    return qs2, factors, -1.0*offsets
 
 def load_q5_k(data):
     # C implementation
@@ -507,7 +531,7 @@ GGML_LOAD = {
     "Q8_0": load_q8_0,
     # "Q2_K": load_q2_k,
     # "Q3_K": load_q3_k,
-    "Q4_K": load_q4_k,
+    "Q4_K": load_q4_k_int4,
     # "Q5_K": load_q5_k,
     "Q6_K": load_q6_k,
 }

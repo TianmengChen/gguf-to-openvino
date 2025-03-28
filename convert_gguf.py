@@ -392,7 +392,7 @@ def make_int8_weights(key, consts, reorder, head_size, group_size):#weight = ov.
     weights.set_friendly_name(name=f"{key}.weight")
     weights_f16 = opset.convert(weights, Type.f16)
 
-    zero_point = (-bias / scale).astype(np.uint8)
+    zero_point =  np.round(-bias / scale).astype(np.uint8)
     zero_points = opset.constant(zero_point, dtype=np.uint8)
     zero_points_f16 = opset.convert(zero_points, Type.f16)
 
@@ -453,7 +453,8 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
     elif "Q4_0" in qtype:
         final_node = make_int4_weights(key, consts, reorder, head_size, 32)
     elif "Q4_K" in qtype:
-        final_node = make_int4_weights(key, consts, reorder, head_size, 32)
+        # final_node = make_int4_weights(key, consts, reorder, head_size, 32)
+        final_node = make_int8_weights(key, consts, reorder, head_size, 32)
     elif "Q6_K" in qtype:
         final_node = make_int8_weights(key, consts, reorder, head_size, 16)
     else:
