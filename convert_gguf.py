@@ -426,7 +426,7 @@ def make_int4_weights(key, consts, reorder, head_size, group_size):
     weights = opset.constant(weight_tensor, name=f"{key}.weight", shared_memory=False) # Don't use shared_memory=True
     weights_f16 = opset.convert(weights, Type.f16)
 
-    zero_point = (-bias / scale).astype(np.uint8)
+    zero_point = np.round(-bias / scale).astype(np.uint8)
     zero_point_shape = list(zero_point.shape)
     zero_point = zero_point.reshape(-1)
     # Pack zero points: two subsequent values into one
@@ -453,7 +453,7 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
     elif "Q4_0" in qtype:
         final_node = make_int4_weights(key, consts, reorder, head_size, 32)
     elif "Q4_K" in qtype:
-        final_node = make_int4_weights(key, consts, reorder, head_size, 256)
+        final_node = make_int4_weights(key, consts, reorder, head_size, 32)
     elif "Q6_K" in qtype:
         final_node = make_int8_weights(key, consts, reorder, head_size, 16)
     else:

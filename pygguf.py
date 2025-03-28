@@ -230,6 +230,28 @@ def load_q3_k(data):
         (((qs[:, 48:64] >> 6) & 3) - bits[:, 16:, 7])
     ], axis=1)
 
+def unpack_128_4(qs):
+    # Initialize the output array with zeros
+    num_blocks = qs.shape[0]
+    dst = np.zeros((num_blocks, 128), dtype=np.uint8)
+    
+    for i in range(4):
+    # Process the lower 4 bits
+        for j in range(32):
+            x = qs[:, i, j] & 0x0F  # Extract lower 4 bits
+            if j % 2 != 0:
+                x <<= 4  # Shift left by 4 if j is odd
+            dst[:, i*32 + j // 2] += x
+    
+        # Process the higher 4 bits
+        for j in range(32):
+            x = qs[:, i, j] >> 4  # Extract higher 4 bits
+            if j % 2 != 0:
+                x <<= 4  # Shift left by 4 if j is odd
+            dst[:, i*32 + 16 + j // 2] += x
+ 
+    return dst
+
 def load_q4_k(data):
     # C implementation
     # https://github.com/ggerganov/ggml/blob/fca1caafea7de9fbd7efc733b9818f9cf2da3050/src/ggml-quants.c#L1929
@@ -248,13 +270,14 @@ def load_q4_k(data):
     qs2 = data_u8[:, 16:].reshape(num_blocks, 4, 32)
 
     # Dequantize scales and offsets (6 bits and 4 + 2 bits)
-    factors = scale_factors * np.concatenate([qs1[:, 0:4] & 0b111111, (qs1[:, 8:] & 15) | ((qs1[:, 0:4] >> 6) << 4)], axis=1)
-    offsets = scale_offsets * np.concatenate([qs1[:, 4:8] & 0b111111, (qs1[:, 8:] >> 4) | ((qs1[:, 4:8] >> 6) << 4)], axis=1)
-
+    scales = scale_factors * np.concatenate([qs1[:, 0:4] & 0b111111, (qs1[:, 8:] & 15) | ((qs1[:, 0:4] >> 6) << 4)], axis=1)
+    biases = scale_offsets * np.concatenate([qs1[:, 4:8] & 0b111111, (qs1[:, 8:] >> 4) | ((qs1[:, 4:8] >> 6) << 4)], axis=1)
+    biases = -1.0 * biases
     # Interleave low and high quantized bits
-    qs2 = np.stack([qs2 & 0xf, qs2 >> 4], axis=2).reshape(num_blocks, 8, 32)
+    # qs2 = np.stack([qs2 & 0xf, qs2 >> 4], axis=2).reshape(num_blocks, 8, 32)
     # Dequantize final weights using scales and offsets
-    return factors * qs2 - offsets
+    weights = unpack_128_4(qs2)
+    return weights, scales, biases
 
 def load_q5_k(data):
     # C implementation
@@ -484,7 +507,7 @@ GGML_LOAD = {
     "Q8_0": load_q8_0,
     # "Q2_K": load_q2_k,
     # "Q3_K": load_q3_k,
-    # "Q4_K": load_q4_k,
+    "Q4_K": load_q4_k,
     # "Q5_K": load_q5_k,
     "Q6_K": load_q6_k,
 }
