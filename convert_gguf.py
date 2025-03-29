@@ -16,7 +16,11 @@ from openvino.runtime.op import Constant
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
+from convert_tokenizer import create_tokenizer_from_config
+
 OV_XML_FILE_NAME="openvino_model.xml"
+OV_TOKENIZER_FILE_NAME = "openvino_tokenizer.xml"
+OV_DETOKENIZER_FILE_NAME = "openvino_detokenizer.xml"
 
 # GGML_QUANTIZATION_GROUP_SIZE = 32
 
@@ -377,7 +381,6 @@ def make_fp16_weights(key, consts, reorder, head_size):
     return w_f32
 
 def make_int8_weights(key, consts, reorder, head_size, group_size):#weight = ov.Tensor(weight, weight.shape, const_dtype)
-    print("int88888888,", key)
     weight = consts[f"{key}.weight"]
     # weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
@@ -524,17 +527,9 @@ def make_embedding(key, input, consts, qtype):
     return inputs_embeds, embed_f32
 
 
-def save_tokenzier(orig_model_path, ov_model_path):
+def save_original_tokenizer(orig_model_path, ov_model_path):
     tokenizer = AutoTokenizer.from_pretrained(orig_model_path)
     tokenizer.save_pretrained(ov_model_path)
-
-    from openvino_tokenizers import convert_tokenizer
-    OV_TOKENIZER_NAME = "openvino_tokenizer.xml"
-    OV_DETOKENIZER_NAME = "openvino_detokenizer.xml"
-
-    converted = convert_tokenizer(tokenizer, with_detokenizer=True)
-    for model, file_name in zip(converted, (OV_TOKENIZER_NAME, OV_DETOKENIZER_NAME)):
-        ov.save_model(model, Path(ov_model_path) / file_name)
 
 
 def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, position_ids, rope_const, beam_idx, batch_dim, hidden_dim, cos_sin_cached, output_shape):
@@ -797,10 +792,13 @@ def load_gguf_model(model_path: str, all_layer: bool) -> tuple[Dict[str, Any], D
         consts["layers"].append(layer_weights)
     
     cost = time.time() - beg
+
+    tokenizer_config = {key.split(".")[-1]: value for key, value in metadata.items() if key.startswith("tokenizer")}
+
     print(f"extracting done, cost {cost:.2f} seconds.\nmodel configs:")
     # for k, v in config.items():
     #     print(f"{k}: {v}")
-    return config, consts
+    return config, consts, tokenizer_config
 
 
 if __name__ == "__main__":
@@ -813,7 +811,7 @@ if __name__ == "__main__":
     beg = time.time()
     os.makedirs(args.ov_model_path, exist_ok=True)
 
-    config, consts = load_gguf_model(args.org_model_path, args.all_layer)
+    config, consts, tokenizer_config = load_gguf_model(args.org_model_path, args.all_layer)
     model = create_model(config, consts)
     cost = time.time() - beg
     print(f"convert done, cost {cost:.2f} seconds.")
@@ -825,12 +823,29 @@ if __name__ == "__main__":
     cost = time.time() - beg
     print(f"serialize done, cost {cost:.2f} seconds.")
 
+    print("create tokenizer and detokenizer...")
+    beg = time.time()
+    tokenizer, detokenizer = create_tokenizer_from_config(tokenizer_config)
+    # todo: check chat_template
+    cost = time.time() - beg
+    print(f"create tokenizer and detokenizer done, cost {cost:.2f} seconds.")
+    print("tokenizer:")
+    show_model(tokenizer)
+    print("detokenizer:")
+    show_model(detokenizer)
+
+    print(f"serialize ov tokenizer and detokenizer to '{args.ov_model_path}'...")
+    beg = time.time()
+    serialize(tokenizer, os.path.join(args.ov_model_path, OV_TOKENIZER_FILE_NAME))
+    serialize(detokenizer, os.path.join(args.ov_model_path, OV_DETOKENIZER_FILE_NAME))
+    cost = time.time() - beg
+    print(f"serialize done, cost {cost:.2f} seconds.")
     # save tokenizer and config to load with GenAI and Optimum
-    model_id = args.model_id or config["model_id"] #"HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
+    model_id = args.model_id or config["model_id"]  # "HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
     if model_id:
-        print(f"save tokenzier to '{args.ov_model_path}' ...")
-        save_tokenzier(model_id, args.ov_model_path)
+        print(f"save original tokenzier to '{args.ov_model_path}' ...")
+        save_original_tokenizer(model_id, args.ov_model_path)
         config = AutoConfig.from_pretrained(model_id)
         config.save_pretrained(args.ov_model_path)
     else:
-        print("[WARNING]: Tokenizer and config.json were not saved because model_id was not found or provided as an option.")
+        print("[WARNING]: config.json were not saved because model_id was not found or provided as an option.")

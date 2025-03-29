@@ -5,3 +5,4 @@ openvino-tokenizers==2025.0.0.0
 mlx==0.23.1
 transformers==4.49.0
 torch==2.0.1
+numpy>=2.1.3
