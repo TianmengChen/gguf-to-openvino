@@ -837,6 +837,7 @@ if __name__ == "__main__":
     print(f"serialize ov tokenizer and detokenizer to '{args.ov_model_path}'...")
     beg = time.time()
     serialize(tokenizer, os.path.join(args.ov_model_path, OV_TOKENIZER_FILE_NAME))
+    print("debug")
     serialize(detokenizer, os.path.join(args.ov_model_path, OV_DETOKENIZER_FILE_NAME))
     cost = time.time() - beg
     print(f"serialize done, cost {cost:.2f} seconds.")
