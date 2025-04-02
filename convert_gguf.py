@@ -377,7 +377,6 @@ def make_fp16_weights(key, consts, reorder, head_size):
     return w_f32
 
 def make_int8_weights(key, consts, reorder, head_size, group_size):#weight = ov.Tensor(weight, weight.shape, const_dtype)
-    print("int88888888,", key)
     weight = consts[f"{key}.weight"]
     # weight = weight.view(np.uint8)
     orig_weight_shape = list(weight.shape)
@@ -710,24 +709,25 @@ def load_gguf_model(model_path: str, all_layer: bool) -> tuple[Dict[str, Any], D
         url_parts = metadata["general.source.url"].split("/")
         model_id = f"{url_parts[-2]}/{url_parts[-1]}"
     except Exception:
-        print("Cannot get model_id to get the config.json and tokenizer")
-        model_id = None
-    model_id = "Qwen/Qwen2.5-7B-Instruct"
+        print("Cannot get model_id to get the config.json and tokenizer, try default model_id Qwen/Qwen2.5-7B-Instruct")
+        model_id = "Qwen/Qwen2.5-7B-Instruct"
+
+
+    architecture = metadata["general.architecture"]
     config.update({
-        "layer_num": metadata["qwen2.block_count"],
-        "head_num": metadata["qwen2.attention.head_count"],
-        "head_size": metadata["qwen2.embedding_length"] // metadata["qwen2.attention.head_count"],
-        "head_num_kv": metadata.get("qwen2.attention.head_count_kv", metadata["qwen2.attention.head_count"]),
-        "hidden_size": metadata["qwen2.embedding_length"],
-        "max_position_embeddings": metadata.get("qwen2.context_length", np.int32([2048])),
+        "layer_num": metadata[architecture+".block_count"],
+        "head_num": metadata[architecture+".attention.head_count"],
+        "head_size": metadata[architecture+".embedding_length"] // metadata[architecture+".attention.head_count"],
+        "head_num_kv": metadata.get(architecture+".attention.head_count_kv", metadata[architecture+".attention.head_count"]),
+        "hidden_size": metadata[architecture+".embedding_length"],
+        "max_position_embeddings": metadata.get(architecture+".context_length", np.int32([2048])),
         "rotary_dims": 128,
-        "rms_norm_eps": metadata["qwen2.attention.layer_norm_rms_epsilon"],
-        "rope_freq_base": metadata.get("qwen2.rope.freq_base", np.float32(10000)),
+        "rms_norm_eps": metadata[architecture+".attention.layer_norm_rms_epsilon"],
+        "rope_freq_base": metadata.get(architecture+".rope.freq_base", np.float32(10000)),
         "file_type": get_quantizaiton_type(metadata.get("general.file_type")),
         "model_id": model_id,        
     })
 
-    print("Config:\n", config)
 
     # Extract weights and biases
     print("Extract weights and biases")
