@@ -4,7 +4,7 @@ from transformers import set_seed
 
 def main():
     set_seed(42)
-    model_dir = 'qwen'
+    model_dir = 'qwen-ov'
 
     device = 'CPU'  # GPU can be used as well
     pipe = openvino_genai.LLMPipeline(model_dir, device)
