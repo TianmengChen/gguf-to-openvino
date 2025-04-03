@@ -459,7 +459,7 @@ def make_weights_subgraph(key, consts, qtype, reorder, head_size):
     elif "Q6_K" == qtype:
         final_node = make_int8_weights(key, consts, reorder, head_size, 16)
     else:
-        raise ValueError("Unsupported quantization type:")
+        raise ValueError("Unsupported quantization type: ", qtype)
     
     return final_node
 
@@ -542,8 +542,11 @@ def layer(configs, consts, layer_idx, hidden_states, attn_mask, causal_mask, pos
     # layerNorm operation
     input_layernorm = make_rms_norm(f"model.layers.{layer_idx}.input_layernorm", hidden_states, consts["layers"][layer_idx], configs["rms_norm_eps"])
 
-    q = make_fc(f"model.layers.{layer_idx}.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_q.weight_qtype"], False, configs["head_size"])
-    k = make_fc(f"model.layers.{layer_idx}.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_k.weight_qtype"], False, configs["head_size"])
+    reorder = False
+    if configs["architecture"] == "llama":
+        reorder = True
+    q = make_fc(f"model.layers.{layer_idx}.self_attn.q_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_q.weight_qtype"], reorder, configs["head_size"])
+    k = make_fc(f"model.layers.{layer_idx}.self_attn.k_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_k.weight_qtype"], reorder, configs["head_size"])
     v = make_fc(f"model.layers.{layer_idx}.self_attn.v_proj", input_layernorm, consts["layers"][layer_idx], config[f"blk.{layer_idx}.attn_v.weight_qtype"])
 
     input_shape = opset.shape_of(input_layernorm)
@@ -704,17 +707,9 @@ def load_gguf_model(model_path: str, all_layer: bool) -> tuple[Dict[str, Any], D
                 else:
                     weights[name] = weight
 
-    # print("Metadata:\n", metadata.keys())
-    try:
-        url_parts = metadata["general.source.url"].split("/")
-        model_id = f"{url_parts[-2]}/{url_parts[-1]}"
-    except Exception:
-        print("Cannot get model_id to get the config.json and tokenizer, try default model_id Qwen/Qwen2.5-7B-Instruct")
-        model_id = "Qwen/Qwen2.5-7B-Instruct"
-
-
     architecture = metadata["general.architecture"]
     config.update({
+        "architecture": architecture,
         "layer_num": metadata[architecture+".block_count"],
         "head_num": metadata[architecture+".attention.head_count"],
         "head_size": metadata[architecture+".embedding_length"] // metadata[architecture+".attention.head_count"],
@@ -725,7 +720,7 @@ def load_gguf_model(model_path: str, all_layer: bool) -> tuple[Dict[str, Any], D
         "rms_norm_eps": metadata[architecture+".attention.layer_norm_rms_epsilon"],
         "rope_freq_base": metadata.get(architecture+".rope.freq_base", np.float32(10000)),
         "file_type": get_quantizaiton_type(metadata.get("general.file_type")),
-        "model_id": model_id,        
+        # "model_id": model_id,        
     })
 
 
@@ -748,58 +743,104 @@ def load_gguf_model(model_path: str, all_layer: bool) -> tuple[Dict[str, Any], D
         consts["lm_head.biases"] = np.array(weights["output.biases"])
     
     config["model.embed_tokens.weight"+"_qtype"] = config["token_embd.weight"+"_qtype"]
-    config["lm_head.weight"+"_qtype"] = config["output.weight"+"_qtype"]
     
+    if config.get("output.weight"+"_qtype", None) is not None:
+        config["lm_head.weight"+"_qtype"] = config["output.weight"+"_qtype"] 
+
     # Extract layer weights
     print("Extract layer weights")
-    for i in range(config["layer_num"]):
-        layer_weights = {
-            f"model.layers.{i}.input_layernorm.weight": np.array(weights[f"blk.{i}.attn_norm.weight"]),
-            f"model.layers.{i}.post_attention_layernorm.weight": np.array(weights[f"blk.{i}.ffn_norm.weight"]),
-            # "model.layers.self_attn.q_proj.bias": None,
-            f"model.layers.{i}.self_attn.q_proj.bias": np.array(weights[f"blk.{i}.attn_q.bias"]),
-            f"model.layers.{i}.self_attn.q_proj.weight": np.array(weights[f"blk.{i}.attn_q.weight"]),
-            # "model.layers.self_attn.k_proj.bias": None,
-            f"model.layers.{i}.self_attn.k_proj.bias": np.array(weights[f"blk.{i}.attn_k.bias"]),
-            f"model.layers.{i}.self_attn.k_proj.weight": np.array(weights[f"blk.{i}.attn_k.weight"]),
-            # "model.layers.self_attn.v_proj.bias": None,
-            f"model.layers.{i}.self_attn.v_proj.bias": np.array(weights[f"blk.{i}.attn_v.bias"]),
-            f"model.layers.{i}.self_attn.v_proj.weight": np.array(weights[f"blk.{i}.attn_v.weight"]),
-            f"model.layers.{i}.self_attn.o_proj.bias": None,
-            f"model.layers.{i}.self_attn.o_proj.weight": np.array(weights[f"blk.{i}.attn_output.weight"]),
-            f"model.layers.{i}.mlp.gate_proj.bias": None,
-            f"model.layers.{i}.mlp.gate_proj.weight": np.array(weights[f"blk.{i}.ffn_gate.weight"]),
-            f"model.layers.{i}.mlp.up_proj.bias": None,
-            f"model.layers.{i}.mlp.up_proj.weight": np.array(weights[f"blk.{i}.ffn_up.weight"]),
-            f"model.layers.{i}.mlp.down_proj.bias": None,
-            f"model.layers.{i}.mlp.down_proj.weight": np.array(weights[f"blk.{i}.ffn_down.weight"])
-        }
-        if not ("F16" in config["file_type"] or "F32" in config["file_type"]):
-            q_weights = {
-                f"model.layers.{i}.self_attn.q_proj.scales": np.array(weights[f"blk.{i}.attn_q.scales"]),
-                f"model.layers.{i}.self_attn.k_proj.scales": np.array(weights[f"blk.{i}.attn_k.scales"]),
-                f"model.layers.{i}.self_attn.v_proj.scales": np.array(weights[f"blk.{i}.attn_v.scales"]),
-                f"model.layers.{i}.self_attn.o_proj.scales": np.array(weights[f"blk.{i}.attn_output.scales"]),
-                f"model.layers.{i}.mlp.gate_proj.scales": np.array(weights[f"blk.{i}.ffn_gate.scales"]),
-                f"model.layers.{i}.mlp.up_proj.scales": np.array(weights[f"blk.{i}.ffn_up.scales"]),
-                f"model.layers.{i}.mlp.down_proj.scales": np.array(weights[f"blk.{i}.ffn_down.scales"]),
-
-                f"model.layers.{i}.self_attn.q_proj.biases": np.array(weights[f"blk.{i}.attn_q.biases"]),
-                f"model.layers.{i}.self_attn.k_proj.biases": np.array(weights[f"blk.{i}.attn_k.biases"]),
-                f"model.layers.{i}.self_attn.v_proj.biases": np.array(weights[f"blk.{i}.attn_v.biases"]),
-                f"model.layers.{i}.self_attn.o_proj.biases": np.array(weights[f"blk.{i}.attn_output.biases"]),
-                f"model.layers.{i}.mlp.gate_proj.biases": np.array(weights[f"blk.{i}.ffn_gate.biases"]),
-                f"model.layers.{i}.mlp.up_proj.biases": np.array(weights[f"blk.{i}.ffn_up.biases"]),
-                f"model.layers.{i}.mlp.down_proj.biases": np.array(weights[f"blk.{i}.ffn_down.biases"])
+    if architecture == "qwen2":    
+        for i in range(config["layer_num"]):
+            layer_weights = {
+                f"model.layers.{i}.input_layernorm.weight": np.array(weights[f"blk.{i}.attn_norm.weight"]),
+                f"model.layers.{i}.post_attention_layernorm.weight": np.array(weights[f"blk.{i}.ffn_norm.weight"]),
+                # "model.layers.self_attn.q_proj.bias": None,
+                f"model.layers.{i}.self_attn.q_proj.bias": np.array(weights[f"blk.{i}.attn_q.bias"]),
+                f"model.layers.{i}.self_attn.q_proj.weight": np.array(weights[f"blk.{i}.attn_q.weight"]),
+                # "model.layers.self_attn.k_proj.bias": None,
+                f"model.layers.{i}.self_attn.k_proj.bias": np.array(weights[f"blk.{i}.attn_k.bias"]),
+                f"model.layers.{i}.self_attn.k_proj.weight": np.array(weights[f"blk.{i}.attn_k.weight"]),
+                # "model.layers.self_attn.v_proj.bias": None,
+                f"model.layers.{i}.self_attn.v_proj.bias": np.array(weights[f"blk.{i}.attn_v.bias"]),
+                f"model.layers.{i}.self_attn.v_proj.weight": np.array(weights[f"blk.{i}.attn_v.weight"]),
+                f"model.layers.{i}.self_attn.o_proj.bias": None,
+                f"model.layers.{i}.self_attn.o_proj.weight": np.array(weights[f"blk.{i}.attn_output.weight"]),
+                f"model.layers.{i}.mlp.gate_proj.bias": None,
+                f"model.layers.{i}.mlp.gate_proj.weight": np.array(weights[f"blk.{i}.ffn_gate.weight"]),
+                f"model.layers.{i}.mlp.up_proj.bias": None,
+                f"model.layers.{i}.mlp.up_proj.weight": np.array(weights[f"blk.{i}.ffn_up.weight"]),
+                f"model.layers.{i}.mlp.down_proj.bias": None,
+                f"model.layers.{i}.mlp.down_proj.weight": np.array(weights[f"blk.{i}.ffn_down.weight"])
             }
-            layer_weights = {**layer_weights, **q_weights}
+            if not ("F16" in config["file_type"] or "F32" in config["file_type"]):
+                q_weights = {
+                    f"model.layers.{i}.self_attn.q_proj.scales": np.array(weights[f"blk.{i}.attn_q.scales"]),
+                    f"model.layers.{i}.self_attn.k_proj.scales": np.array(weights[f"blk.{i}.attn_k.scales"]),
+                    f"model.layers.{i}.self_attn.v_proj.scales": np.array(weights[f"blk.{i}.attn_v.scales"]),
+                    f"model.layers.{i}.self_attn.o_proj.scales": np.array(weights[f"blk.{i}.attn_output.scales"]),
+                    f"model.layers.{i}.mlp.gate_proj.scales": np.array(weights[f"blk.{i}.ffn_gate.scales"]),
+                    f"model.layers.{i}.mlp.up_proj.scales": np.array(weights[f"blk.{i}.ffn_up.scales"]),
+                    f"model.layers.{i}.mlp.down_proj.scales": np.array(weights[f"blk.{i}.ffn_down.scales"]),
 
-        consts["layers"].append(layer_weights)
+                    f"model.layers.{i}.self_attn.q_proj.biases": np.array(weights[f"blk.{i}.attn_q.biases"]),
+                    f"model.layers.{i}.self_attn.k_proj.biases": np.array(weights[f"blk.{i}.attn_k.biases"]),
+                    f"model.layers.{i}.self_attn.v_proj.biases": np.array(weights[f"blk.{i}.attn_v.biases"]),
+                    f"model.layers.{i}.self_attn.o_proj.biases": np.array(weights[f"blk.{i}.attn_output.biases"]),
+                    f"model.layers.{i}.mlp.gate_proj.biases": np.array(weights[f"blk.{i}.ffn_gate.biases"]),
+                    f"model.layers.{i}.mlp.up_proj.biases": np.array(weights[f"blk.{i}.ffn_up.biases"]),
+                    f"model.layers.{i}.mlp.down_proj.biases": np.array(weights[f"blk.{i}.ffn_down.biases"])
+                }
+                layer_weights = {**layer_weights, **q_weights}
+            consts["layers"].append(layer_weights)
+    elif architecture == "llama":  
+        for i in range(config["layer_num"]):
+            layer_weights = {
+                f"model.layers.{i}.input_layernorm.weight": np.array(weights[f"blk.{i}.attn_norm.weight"]),
+                f"model.layers.{i}.post_attention_layernorm.weight": np.array(weights[f"blk.{i}.ffn_norm.weight"]),
+                f"model.layers.{i}.self_attn.q_proj.bias": None,
+                f"model.layers.{i}.self_attn.q_proj.weight": np.array(weights[f"blk.{i}.attn_q.weight"]),
+                f"model.layers.{i}.self_attn.k_proj.bias": None,
+                f"model.layers.{i}.self_attn.k_proj.weight": np.array(weights[f"blk.{i}.attn_k.weight"]),
+                f"model.layers.{i}.self_attn.v_proj.bias": None,
+                f"model.layers.{i}.self_attn.v_proj.weight": np.array(weights[f"blk.{i}.attn_v.weight"]),
+                f"model.layers.{i}.self_attn.o_proj.bias": None,
+                f"model.layers.{i}.self_attn.o_proj.weight": np.array(weights[f"blk.{i}.attn_output.weight"]),
+                f"model.layers.{i}.mlp.gate_proj.bias": None,
+                f"model.layers.{i}.mlp.gate_proj.weight": np.array(weights[f"blk.{i}.ffn_gate.weight"]),
+                f"model.layers.{i}.mlp.up_proj.bias": None,
+                f"model.layers.{i}.mlp.up_proj.weight": np.array(weights[f"blk.{i}.ffn_up.weight"]),
+                f"model.layers.{i}.mlp.down_proj.bias": None,
+                f"model.layers.{i}.mlp.down_proj.weight": np.array(weights[f"blk.{i}.ffn_down.weight"])
+            }
+            if not ("F16" in config["file_type"] or "F32" in config["file_type"]):
+                q_weights = {
+                    f"model.layers.{i}.self_attn.q_proj.scales": np.array(weights[f"blk.{i}.attn_q.scales"]),
+                    f"model.layers.{i}.self_attn.k_proj.scales": np.array(weights[f"blk.{i}.attn_k.scales"]),
+                    f"model.layers.{i}.self_attn.v_proj.scales": np.array(weights[f"blk.{i}.attn_v.scales"]),
+                    f"model.layers.{i}.self_attn.o_proj.scales": np.array(weights[f"blk.{i}.attn_output.scales"]),
+                    f"model.layers.{i}.mlp.gate_proj.scales": np.array(weights[f"blk.{i}.ffn_gate.scales"]),
+                    f"model.layers.{i}.mlp.up_proj.scales": np.array(weights[f"blk.{i}.ffn_up.scales"]),
+                    f"model.layers.{i}.mlp.down_proj.scales": np.array(weights[f"blk.{i}.ffn_down.scales"]),
+
+                    f"model.layers.{i}.self_attn.q_proj.biases": np.array(weights[f"blk.{i}.attn_q.biases"]),
+                    f"model.layers.{i}.self_attn.k_proj.biases": np.array(weights[f"blk.{i}.attn_k.biases"]),
+                    f"model.layers.{i}.self_attn.v_proj.biases": np.array(weights[f"blk.{i}.attn_v.biases"]),
+                    f"model.layers.{i}.self_attn.o_proj.biases": np.array(weights[f"blk.{i}.attn_output.biases"]),
+                    f"model.layers.{i}.mlp.gate_proj.biases": np.array(weights[f"blk.{i}.ffn_gate.biases"]),
+                    f"model.layers.{i}.mlp.up_proj.biases": np.array(weights[f"blk.{i}.ffn_up.biases"]),
+                    f"model.layers.{i}.mlp.down_proj.biases": np.array(weights[f"blk.{i}.ffn_down.biases"])
+                }
+                layer_weights = {**layer_weights, **q_weights}
+            consts["layers"].append(layer_weights)
+
+    else:
+        raise ValueError("Unsupported architecture: ", architecture)
+    
+    
     
     cost = time.time() - beg
     print(f"extracting done, cost {cost:.2f} seconds.\nmodel configs:")
-    # for k, v in config.items():
-    #     print(f"{k}: {v}")
+
     return config, consts
 
 
@@ -826,7 +867,7 @@ if __name__ == "__main__":
     print(f"serialize done, cost {cost:.2f} seconds.")
 
     # save tokenizer and config to load with GenAI and Optimum
-    model_id = args.model_id or config["model_id"] #"HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
+    model_id = args.model_id #or config["model_id"] #"HuggingFaceTB/SmolLM2-135M" #"meta-llama/Llama-2-7b-chat-hf"
     if model_id:
         print(f"save tokenzier to '{args.ov_model_path}' ...")
         save_tokenzier(model_id, args.ov_model_path)
