@@ -38,5 +38,5 @@ python convert_gguf.py --org_model_path models/qwen2.5-0.5b-instruct-q4_0.gguf -
 
 4. Test the model:
 ```sh
-python test.py
+python test.py --ov_model_path models/qwen-ov --prompt 请解释一下欧拉角 --device CPU
 ```

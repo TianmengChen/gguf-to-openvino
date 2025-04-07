@@ -1,17 +1,25 @@
 
 import openvino_genai
 from transformers import set_seed
+import argparse
 
 def main():
     set_seed(42)
-    model_dir = 'qwen-ov'
+    parser = argparse.ArgumentParser("")
+    parser.add_argument("--ov_model_path", type=str, nargs="?", default="qwen-ov")
+    parser.add_argument("--prompt", type=str, nargs="?", default="请解释一下欧拉角")
+    parser.add_argument("--device", type=str, nargs="?", default="CPU")
+    args = parser.parse_args()
 
-    device = 'CPU'  # GPU can be used as well
+    model_dir = args.ov_model_path
+    prompt= args.prompt
+    device = args.device    
+
     pipe = openvino_genai.LLMPipeline(model_dir, device)
 
     config = openvino_genai.GenerationConfig()
     config.max_new_tokens = 100
-    prompt="请解释一下欧拉角"
+    
     pipe.start_chat()
     result = pipe.generate(prompt, config)
     print(result)
