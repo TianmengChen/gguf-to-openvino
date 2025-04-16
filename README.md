@@ -40,3 +40,9 @@ python convert_gguf.py --org_model_path models/qwen2.5-0.5b-instruct-q4_0.gguf -
 ```sh
 python test.py --ov_model_path models/qwen-ov --prompt 请解释一下欧拉角 --device CPU
 ```
+
+5. Debug:
+```sh
+python convert_gguf_split_new_add_name.py  --org_model_path  models\qwen2.5-0.5b-instruct-q4_0.gguf --ov_model_path models\qwen2.5-0.5b-instruct-q4_0-ov-split --all_layer 
+benchmark_app  -data_shape "input_ids[1,64],attention_mask[1,64],position_ids[1,64],beam_idx[1]" -layout "input_ids[NC],attention_mask[NC],position_ids[NC],beam_idx[N]" -hint none -nstreams 1 -nireq 1 -niter 1 -d GPU -m models\qwen2.5-0.5b-instruct-q4_0-ov-split\openvino_model.xml
+```
